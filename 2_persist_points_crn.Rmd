@@ -1,0 +1,613 @@
+
+
+---
+title: "2_persist_points_crn"
+output: html_document
+---
+
+```{r}
+## ---- sanity_precondition_validation_checks ---------------------------------
+## All checks live HERE (packages, files, schemas, compilation, knob validity).
+## After this chunk: no other chunk contains assertions or validation checks.
+
+# =============================================================================
+# 0) Tiny assertion helpers (keep messages consistent)
+# =============================================================================
+assert <- function(ok, msg) if (!isTRUE(ok)) stop(msg, call. = FALSE)
+
+assert_file_exists <- function(path, label = path) {
+  assert(file.exists(path), paste0("Missing required file: ", label, "\nPath: ", path))
+}
+
+assert_has_cols <- function(dt, cols, label) {
+  miss <- setdiff(cols, names(dt))
+  assert(length(miss) == 0, paste0(label, " missing column(s): ", paste(miss, collapse = ", ")))
+}
+
+assert_dir_writable <- function(dir_path, label = dir_path) {
+  if (!dir.exists(dir_path)) {
+    ok <- dir.create(dir_path, recursive = TRUE, showWarnings = FALSE)
+    assert(ok, paste0("Could not create directory: ", label, "\nPath: ", dir_path))
+  }
+  tf <- tempfile("write_test_", tmpdir = dir_path, fileext = ".tmp")
+  ok <- tryCatch({
+    created <- file.create(tf)
+    if (created) unlink(tf)
+    created
+  }, error = function(e) FALSE)
+  assert(ok, paste0("Directory is not writable: ", label, "\nPath: ", dir_path))
+}
+
+# =============================================================================
+# 1) Scope flags
+# =============================================================================
+RUN_MAMMALS <- FALSE
+RUN_BIRDS   <- TRUE
+
+# =============================================================================
+# 2) Simulation constants (match your design)
+# =============================================================================
+EXT_THR   <- 500L        # quasi-extinction threshold
+SHIFT_K   <- EXT_THR     # shifted Gompertz uses log(K - SHIFT_K)
+YEARS     <- 100L
+K_CAP_FAC <- 1.1
+R_BUFFER  <- 0.8
+
+# =============================================================================
+# 3) Runtime knobs
+#    NOTE: With CRNs-as-default, reps live inside the CRN context and are shared
+#          across anchor search + final grid evaluation.
+# =============================================================================
+N_DRAWS <- 760L
+REPS    <- 2500L
+
+# Curves are quantiles over parameter draws of persistence probability
+Q_LEVELS <- c(q50 = 0.50, q16 = 0.16, q025 = 0.025)
+
+# Anchor targets in persistence-prob space (used to fit shifted Gompertz)
+P_ANCHOR <- c(0.025, 0.16, 0.50, 0.84, 0.975)
+
+# Final probability grid: the evaluated points written to disk (Rmd 3 input)
+P_GRID <- c(seq(0.025, 0.975, by = 0.025), 0.99)
+
+# Search tuning (starting bracket for K search; NOT the Gompertz shift)
+START_K  <- 512
+REL_TOL  <- 0.01
+ROUND_K  <- TRUE
+
+# Logging (single knob; keeps later code readable)
+VERBOSE   <- FALSE
+LOG_CRN   <- VERBOSE
+LOG_GOMP  <- VERBOSE
+LOG_FLUSH <- VERBOSE
+
+# Determinism
+BASE_SEED <- 123L
+
+# Chunking (internal; also embedded in CRN context)
+CHUNK_SIZE <- 25L
+
+# =============================================================================
+# 4) Paths
+#    Outputs are ONLY the minimal "persistence points" tables used by Rmd 3.
+#    - Mammals: one CSV
+#    - Birds:   one CSV (all combos appended), NOT one file per combo
+# =============================================================================
+PATHS <- list(
+  # inputs (from previous Rmd)
+  mammal_mass_grid = "Data/Clean/mammal_mass_grid.csv",
+  bird_mass_grid   = "Data/Clean/bird_mass_grid.csv",
+  bird_ilr_coords  = "Data/Clean/bird_ilr_combo_coords.csv",
+
+  post_m_rm  = "Data/Clean/post_mammal_rm_coefs.csv",
+  post_m_sg  = "Data/Clean/post_mammal_sigma_coefs.csv",
+  post_b_rm  = "Data/Clean/post_bird_r_coefs.csv",
+  post_b_sg  = "Data/Clean/post_bird_sigma_ilr_coefs.csv",
+
+  # outputs (Rmd 3 diagnostic + fit inputs)
+  results_dir     = "Data/Results",
+  mammals_points  = "Data/Results/persist_points_mammals.csv",
+  birds_points    = "Data/Results/persist_points_birds.csv"
+)
+
+CPP_FILE    <- "src/simulate_persist_probs_cpp.cpp"
+REBUILD_CPP <- FALSE
+
+# =============================================================================
+# 5) Packages
+# =============================================================================
+pkgs_needed <- c("data.table", "Rcpp")
+missing_pkgs <- pkgs_needed[!vapply(pkgs_needed, requireNamespace, logical(1), quietly = TRUE)]
+assert(
+  length(missing_pkgs) == 0,
+  paste0(
+    "Missing required R package(s): ", paste(missing_pkgs, collapse = ", "),
+    "\nInstall them with: install.packages(c(",
+    paste0('"', missing_pkgs, '"', collapse = ", "),
+    "))"
+  )
+)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Rcpp)
+})
+
+# =============================================================================
+# 6) Knob sanity
+# =============================================================================
+assert(is.logical(RUN_MAMMALS) && length(RUN_MAMMALS) == 1, "RUN_MAMMALS must be TRUE/FALSE.")
+assert(is.logical(RUN_BIRDS)   && length(RUN_BIRDS)   == 1, "RUN_BIRDS must be TRUE/FALSE.")
+assert(isTRUE(RUN_MAMMALS) || isTRUE(RUN_BIRDS), "At least one of RUN_MAMMALS or RUN_BIRDS must be TRUE.")
+
+assert(is.logical(VERBOSE)   && length(VERBOSE)   == 1, "VERBOSE must be TRUE/FALSE.")
+assert(is.logical(LOG_CRN)   && length(LOG_CRN)   == 1, "LOG_CRN must be TRUE/FALSE.")
+assert(is.logical(LOG_GOMP)  && length(LOG_GOMP)  == 1, "LOG_GOMP must be TRUE/FALSE.")
+assert(is.logical(LOG_FLUSH) && length(LOG_FLUSH) == 1, "LOG_FLUSH must be TRUE/FALSE.")
+
+assert(N_DRAWS > 0 && REPS > 0, "N_DRAWS and REPS must be positive.")
+assert(YEARS > 0 && EXT_THR > 0, "YEARS and EXT_THR must be positive integers.")
+assert(SHIFT_K == EXT_THR, "SHIFT_K must equal EXT_THR (intended Gompertz shift).")
+assert(START_K > EXT_THR, "START_K must be > EXT_THR (keeps Gompertz shift well-defined).")
+assert(CHUNK_SIZE > 0, "CHUNK_SIZE must be positive.")
+
+assert(all(P_ANCHOR > 0 & P_ANCHOR < 1) && all(diff(P_ANCHOR) > 0),
+       "P_ANCHOR must be strictly increasing in (0,1).")
+assert(all(P_GRID   > 0 & P_GRID   < 1) && all(diff(P_GRID)   > 0),
+       "P_GRID must be strictly increasing in (0,1).")
+
+# Note on K bounds:
+# We deliberately do NOT enforce a K_MIN clamp in the search/grid.
+# Assumption: every K we evaluate (anchors + grid) is > 500 in practice.
+
+# =============================================================================
+# 7) Filesystem preconditions
+# =============================================================================
+assert_file_exists(CPP_FILE, "C++ simulator file (CPP_FILE)")
+
+inputs_needed <- character(0)
+if (isTRUE(RUN_MAMMALS)) {
+  inputs_needed <- c(inputs_needed, PATHS$mammal_mass_grid, PATHS$post_m_rm, PATHS$post_m_sg)
+}
+if (isTRUE(RUN_BIRDS)) {
+  inputs_needed <- c(inputs_needed, PATHS$bird_mass_grid, PATHS$bird_ilr_coords, PATHS$post_b_rm, PATHS$post_b_sg)
+}
+for (p in inputs_needed) assert_file_exists(p)
+
+assert_dir_writable(PATHS$results_dir, label = "Data/Results")
+
+# =============================================================================
+# 8) Compile/load C++ (CRN-first API)
+# =============================================================================
+rcpp_cache <- file.path("Data", ".rcpp_cache")
+dir.create(rcpp_cache, recursive = TRUE, showWarnings = FALSE)
+
+Rcpp::sourceCpp(
+  file     = CPP_FILE,
+  cacheDir = rcpp_cache,
+  rebuild  = REBUILD_CPP,
+  verbose  = FALSE
+)
+
+assert(exists("crn_context_create"),         "C++ symbol missing: crn_context_create")
+assert(exists("simulate_persist_qvec_cpp"),  "C++ symbol missing: simulate_persist_qvec_cpp")
+assert(exists("simulate_persist_probs_cpp"), "C++ symbol missing: simulate_persist_probs_cpp")
+
+# =============================================================================
+# 9) Schema checks (read headers only: fast)
+# =============================================================================
+if (isTRUE(RUN_MAMMALS)) {
+  hdr_m_mass <- fread(PATHS$mammal_mass_grid, nrows = 0)
+  hdr_pmrm   <- fread(PATHS$post_m_rm,        nrows = 0)
+  hdr_pmsg   <- fread(PATHS$post_m_sg,        nrows = 0)
+
+  assert_has_cols(hdr_m_mass, c("Mass_g"),             "mammal_mass_grid")
+  assert_has_cols(hdr_pmrm,   c("alpha", "beta_logM"), "post_mammal_rm_coefs")
+  assert_has_cols(hdr_pmsg,   c("alpha", "beta_logM"), "post_mammal_sigma_coefs")
+}
+
+if (isTRUE(RUN_BIRDS)) {
+  hdr_b_mass <- fread(PATHS$bird_mass_grid,  nrows = 0)
+  hdr_ilr    <- fread(PATHS$bird_ilr_coords, nrows = 0)
+  hdr_pbrm   <- fread(PATHS$post_b_rm,       nrows = 0)
+  hdr_pbsg   <- fread(PATHS$post_b_sg,       nrows = 0)
+
+  assert_has_cols(hdr_b_mass, c("Mass_g"),                "bird_mass_grid")
+  assert_has_cols(hdr_ilr,    c("combo", "ilr1", "ilr2"), "bird_ilr_combo_coords")
+  assert_has_cols(hdr_pbrm,   c("alpha", "beta_logM"),    "post_bird_r_coefs")
+  assert_has_cols(hdr_pbsg,   c("alpha", "beta_logM", "beta_ilr1", "beta_ilr2"),
+                  "post_bird_sigma_ilr_coefs")
+}
+
+# =============================================================================
+# 10) Load inputs (only what we actually need)
+# =============================================================================
+if (isTRUE(RUN_MAMMALS)) {
+  mammal_mass <- fread(PATHS$mammal_mass_grid, select = "Mass_g")[["Mass_g"]]
+  post_m_rm   <- fread(PATHS$post_m_rm,        select = c("alpha", "beta_logM"))
+  post_m_sg   <- fread(PATHS$post_m_sg,        select = c("alpha", "beta_logM"))
+}
+
+if (isTRUE(RUN_BIRDS)) {
+  bird_mass <- fread(PATHS$bird_mass_grid, select = "Mass_g")[["Mass_g"]]
+  bird_ilr  <- fread(PATHS$bird_ilr_coords, select = c("combo", "ilr1", "ilr2"))
+  post_b_rm <- fread(PATHS$post_b_rm,      select = c("alpha", "beta_logM"))
+  post_b_sg <- fread(PATHS$post_b_sg,      select = c("alpha", "beta_logM", "beta_ilr1", "beta_ilr2"))
+}
+
+# =============================================================================
+# 11) Fixed posterior index vectors (deterministic; only compute what we use)
+# =============================================================================
+if (isTRUE(RUN_MAMMALS)) {
+  set.seed(BASE_SEED + 7001); IDX_M_R <- sample.int(nrow(post_m_rm), N_DRAWS, replace = TRUE)
+  set.seed(BASE_SEED + 8001); IDX_M_S <- sample.int(nrow(post_m_sg), N_DRAWS, replace = TRUE)
+}
+if (isTRUE(RUN_BIRDS)) {
+  set.seed(BASE_SEED + 9001);  IDX_B_R <- sample.int(nrow(post_b_rm), N_DRAWS, replace = TRUE)
+  set.seed(BASE_SEED + 10001); IDX_B_S <- sample.int(nrow(post_b_sg), N_DRAWS, replace = TRUE)
+}
+
+# =============================================================================
+# 12) Create CRN context (single shared RNG experiment for this script)
+# =============================================================================
+CRN_CTX <- crn_context_create(
+  seed       = as.integer(BASE_SEED),
+  n_draws    = as.integer(N_DRAWS),
+  reps       = as.integer(REPS),
+  years      = as.integer(YEARS),
+  chunk_size = as.integer(CHUNK_SIZE)
+  # seed_stride left at C++ default (10007) for simplicity
+)
+
+# =============================================================================
+# 13) CRN self-test (tiny, deterministic, cheap)
+# =============================================================================
+# Same inputs + same CRN context must give exactly identical outputs.
+# This verifies the “CRNs-as-default” contract without writing any files.
+
+test_r     <- rep(0.1, N_DRAWS)
+test_sigma <- rep(0.2, N_DRAWS)
+test_K     <- 1000
+
+q1 <- simulate_persist_qvec_cpp(
+  r          = test_r,
+  sigma      = test_sigma,
+  K          = as.double(test_K),
+  ext_thr    = as.integer(EXT_THR),
+  cap_factor = as.double(K_CAP_FAC),
+  crn_ctx    = CRN_CTX
+)
+
+q2 <- simulate_persist_qvec_cpp(
+  r          = test_r,
+  sigma      = test_sigma,
+  K          = as.double(test_K),
+  ext_thr    = as.integer(EXT_THR),
+  cap_factor = as.double(K_CAP_FAC),
+  crn_ctx    = CRN_CTX
+)
+
+assert(isTRUE(all.equal(q1, q2, tolerance = 0)), "CRN self-test failed: repeated calls did not match exactly.")
+```
+
+```{r}
+## ---- helpers_no_checks ------------------------------------------------------
+## Pure helpers: no assertions, no validation.
+## This script's ONLY on-disk product should be a tidy "persistence points" table
+## that Rmd 3 can use for diagnostics + final (a,b) fitting.
+
+# -----------------------------------------------------------------------------
+# Logging (stdout only; no files)
+# -----------------------------------------------------------------------------
+log_msg <- function(...) {
+  cat(sprintf("[%s] %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), paste(..., collapse = " ")))
+  if (isTRUE(LOG_FLUSH)) flush.console()
+}
+
+# -----------------------------------------------------------------------------
+# Parameter samplers (draw r and sigma vectors for the N_DRAWS posterior draws)
+# -----------------------------------------------------------------------------
+mammal_sampler <- function(mass_g) {
+  logM <- log10(mass_g)
+  r <- R_BUFFER * 10^(post_m_rm$alpha[IDX_M_R] + post_m_rm$beta_logM[IDX_M_R] * logM)
+  s <-              10^(post_m_sg$alpha[IDX_M_S] + post_m_sg$beta_logM[IDX_M_S] * logM)
+  list(r = as.numeric(r), sigma = as.numeric(s))
+}
+
+bird_sampler_factory <- function(ilr1, ilr2) {
+  force(ilr1); force(ilr2)
+  function(mass_g) {
+    logM <- log10(mass_g)
+    r <- R_BUFFER * 10^(post_b_rm$alpha[IDX_B_R] + post_b_rm$beta_logM[IDX_B_R] * logM)
+    s <-              10^(post_b_sg$alpha[IDX_B_S] +
+                          post_b_sg$beta_logM[IDX_B_S] * logM +
+                          post_b_sg$beta_ilr1[IDX_B_S] * ilr1 +
+                          post_b_sg$beta_ilr2[IDX_B_S] * ilr2)
+    list(r = as.numeric(r), sigma = as.numeric(s))
+  }
+}
+
+# -----------------------------------------------------------------------------
+# C++ wrappers (CRN-first)
+#   - All simulation uses CRNs via a single CRN context.
+#   - Both anchors and grid points call the same C++ function.
+#   - We keep chunk_size out of wrappers (it lives in CRN_CTX).
+# Returns a named vector: c(q50, q16, q025)
+# -----------------------------------------------------------------------------
+eval_qvec_crn <- function(r, sigma, K, crn_ctx) {
+  simulate_persist_qvec_cpp(
+    r          = r,
+    sigma      = sigma,
+    K          = as.double(K),
+    ext_thr    = as.integer(EXT_THR),
+    cap_factor = as.double(K_CAP_FAC),
+    crn_ctx    = crn_ctx
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Anchor search: smallest K where chosen quantile >= p_target
+# (Monotone q(K) assumption)
+# -----------------------------------------------------------------------------
+find_K_for_target <- function(p_target, get_q_at_K, low0, high0, rel_tol = REL_TOL) {
+  low  <- low0
+  high <- high0
+
+  # Expand upward until we cross the target.
+  while (get_q_at_K(high) < p_target) {
+    low  <- high
+    high <- high * 2
+  }
+  hi_bracket <- high
+
+  # Bisection within [low, high]
+  while ((high - low) > rel_tol * high) {
+    mid <- (low + high) / 2
+    if (get_q_at_K(mid) >= p_target) high <- mid else low <- mid
+  }
+
+  list(K = (low + high) / 2, hi_bracket = hi_bracket)
+}
+
+# -----------------------------------------------------------------------------
+# Rough shifted-Gompertz fit (used ONLY to pick a good K grid efficiently).
+# Final (a,b) fitting and diagnostics happen in Rmd 3, using the points we save.
+#
+# p(K) = exp( -a * (K - SHIFT_K)^(-b) )
+# -----------------------------------------------------------------------------
+fit_gompertz_ab <- function(K_anchor, p_anchor) {
+  x <- pmax(as.numeric(K_anchor) - SHIFT_K, 1e-12)  # avoid log(0)
+  p <- as.numeric(p_anchor)
+
+  # Starts from the linearized form: log(-log(p)) = log(a) - b*log(x)
+  y  <- log(-log(p))
+  lx <- log(x)
+  lm0 <- lm(y ~ lx)
+  b0  <- -as.numeric(coef(lm0)[["lx"]])
+  a0  <-  exp(as.numeric(coef(lm0)[["(Intercept)"]]))
+
+  if (!is.finite(b0) || b0 <= 0) b0 <- 1
+  if (!is.finite(a0) || a0 <= 0) a0 <- 1
+  b0 <- max(1e-4, min(80, b0))
+  a0 <- max(1e-12, a0)
+
+  fml <- p ~ exp(-exp(loga) * x^(-exp(logb)))
+  ctrl <- nls.control(maxiter = 500, tol = 1e-7, minFactor = 1/2048, warnOnly = TRUE)
+
+  # Small multi-start on b improves robustness when anchors are noisy
+  mult   <- c(0.5, 0.8, 1, 1.25, 1.6, 2, 3, 5)
+  b_grid <- unique(pmax(1e-4, pmin(80, b0 * mult)))
+  i_mid  <- match(0.50, p_anchor)
+
+  fit <- NULL
+  for (b_try in b_grid) {
+    a_try <- -log(p[i_mid]) * x[i_mid]^b_try
+    if (!is.finite(a_try) || a_try <= 0) a_try <- a0
+
+    fit <- tryCatch(
+      nls(
+        fml,
+        data      = data.frame(p = p, x = x),
+        start     = list(loga = log(a_try), logb = log(b_try)),
+        algorithm = "port",
+        control   = ctrl
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(fit)) break
+  }
+
+  if (is.null(fit)) stop("Gompertz pre-fit failed while building the K grid.", call. = FALSE)
+
+  co <- coef(fit)
+  list(a = exp(as.numeric(co[["loga"]])),
+       b = exp(as.numeric(co[["logb"]])))
+}
+
+# Invert shifted Gompertz to propose K values spanning probabilities in P_GRID
+invert_gompertz <- function(a, b, p_grid) {
+  p <- pmin(pmax(as.numeric(p_grid), 1e-6), 1 - 1e-8)
+  K <- SHIFT_K + (a / -log(p))^(1 / b)
+  if (isTRUE(ROUND_K)) round(K) else ceiling(K)
+}
+
+# -----------------------------------------------------------------------------
+# Main driver for one scenario (mammals OR a bird combo)
+#
+# Writes ONE tidy table of "persistence points" with columns (minimal Rmd 3 input):
+#   combo    : bird diet combo (NA for mammals)
+#   mass_idx : 1..N within the mass grid used for this run
+#   mass_g   : body mass (g)
+#   curve    : which quantile curve (q50, q16, q025)
+#   K        : K used for evaluation
+#   p_eval   : simulated persistence probability for that curve at that K
+# -----------------------------------------------------------------------------
+run_one_scenario <- function(masses_g, sampler, out_file, crn_ctx,
+                             combo = NA_character_, append = FALSE) {
+
+  # Start fresh unless we're explicitly appending (used for birds: many combos -> one file)
+  if (!isTRUE(append) && file.exists(out_file)) file.remove(out_file)
+  wrote_any <- file.exists(out_file)  # if file already exists, header is already there
+
+  write_points <- function(dt) {
+    fwrite(dt, out_file, append = wrote_any, col.names = !wrote_any)
+    wrote_any <<- TRUE
+  }
+
+  q_names <- names(Q_LEVELS)
+
+  for (mi in seq_along(masses_g)) {
+    mass <- masses_g[mi]
+    pars <- sampler(mass)
+    r    <- pars$r
+    sg   <- pars$sigma
+
+    # Cache CRN evaluations by K for this (mass, combo) to avoid repeated work.
+    cache <- new.env(parent = emptyenv())
+
+    evalK <- function(K, who = "") {
+      key <- sprintf("%.17g", K)
+      v <- cache[[key]]
+      if (!is.null(v)) return(v)
+
+      qv <- eval_qvec_crn(r, sg, K, crn_ctx)
+
+      if (isTRUE(LOG_CRN)) {
+        log_msg("CRN", who,
+                "| mass_idx=", mi,
+                "mass_g=", formatC(mass, format = "f", digits = 0),
+                "K=", formatC(K, format = "f", digits = 0),
+                "q50=", sprintf("%.4f", qv["q50"]),
+                "q16=", sprintf("%.4f", qv["q16"]),
+                "q025=", sprintf("%.4f", qv["q025"]))
+      }
+
+      cache[[key]] <- qv
+      qv
+    }
+
+    for (ci in seq_along(q_names)) {
+      qtag <- q_names[ci]
+
+      # 1) Find anchor K values (bisections) for this curve
+      K_anchor <- numeric(length(P_ANCHOR))
+      hi_prev  <- as.numeric(START_K)
+
+      for (ai in seq_along(P_ANCHOR)) {
+        pt  <- P_ANCHOR[ai]
+        who <- paste0("| stage=anchor q=", qtag, " p_target=", sprintf("%.3f", pt))
+        get_q <- function(K) evalK(K, who = who)[[qtag]]
+
+        if (ai == 1L) {
+          low0  <- hi_prev
+          high0 <- hi_prev
+        } else {
+          high0 <- hi_prev
+          low0  <- hi_prev / 2
+        }
+
+        res <- find_K_for_target(pt, get_q, low0 = low0, high0 = high0, rel_tol = REL_TOL)
+        K_anchor[ai] <- res$K
+        hi_prev      <- res$hi_bracket
+      }
+
+      # 2) Use a rough Gompertz fit ONLY to propose a good K grid spanning P_GRID
+      ab      <- fit_gompertz_ab(K_anchor, P_ANCHOR)
+      K_guess <- invert_gompertz(ab$a, ab$b, P_GRID)
+
+      # 3) Evaluate points on that grid with the SAME CRNs (default behaviour)
+      p_hat <- numeric(length(K_guess))
+      for (ki in seq_along(K_guess)) {
+        Kk <- K_guess[ki]
+        who <- paste0("| stage=grid q=", qtag, " p_target=", sprintf("%.3f", P_GRID[ki]))
+        qv <- evalK(Kk, who = who)
+        p_hat[ki] <- qv[[qtag]]
+      }
+
+      # 4) Write the minimal point table (Rmd 3 diagnostic + fit input)
+      write_points(data.table(
+        combo    = combo,
+        mass_idx = as.integer(mi),
+        mass_g   = as.numeric(mass),
+        curve    = qtag,                 # q50 / q16 / q025
+        K        = as.numeric(K_guess),
+        p_eval   = as.numeric(p_hat)
+      ))
+
+      # Optional: quick anchor-fit diagnostics (stdout only)
+      if (isTRUE(LOG_GOMP)) {
+        x_anchor <- as.numeric(K_anchor) - SHIFT_K
+        p_fit    <- exp(-ab$a * x_anchor^(-ab$b))
+        delta    <- p_fit - as.numeric(P_ANCHOR)
+        log_msg("GOMP",
+                "| stage=pregrid q=", qtag,
+                "| mass_idx=", mi,
+                "mass_g=", formatC(mass, format = "f", digits = 0),
+                "| deltas(p_fit - p_target)=",
+                paste(sprintf("p=%.3f:%+.5f", P_ANCHOR, delta), collapse = " "))
+      }
+    }
+
+    log_msg("DONE | mass_idx=", mi, "/", length(masses_g),
+            " mass_g=", formatC(mass, format = "f", digits = 0))
+  }
+
+  invisible(NULL)
+}
+```
+
+```{r}
+## ---- run_mammals ------------------------------------------------------------
+## Output: a single tidy "persistence points" table used by Rmd 3.
+## Nothing else is saved (no ab grids, no per-mass summaries).
+
+if (isTRUE(RUN_MAMMALS)) {
+  log_msg("MAMMALS | start")
+  
+  run_one_scenario(
+    masses_g   = mammal_mass,
+    sampler    = mammal_sampler,
+    out_file   = PATHS$mammals_points,
+    crn_ctx    = CRN_CTX,
+    combo      = NA_character_,
+    append     = FALSE
+  )
+ 
+  log_msg("MAMMALS | wrote:", PATHS$mammals_points)
+  log_msg("MAMMALS | done")
+}
+```
+
+```{r}
+## ---- run_birds --------------------------------------------------------------
+## Output: one tidy "persistence points" table for ALL bird combos (single file).
+## This is the diagnostic + fit input for Rmd 3.
+
+if (isTRUE(RUN_BIRDS)) {
+  log_msg("BIRDS | start")
+
+  # One file for all combos (append each combo's points)
+  birds_out <- PATHS$birds_points
+  if (file.exists(birds_out)) file.remove(birds_out)
+
+  for (i in seq_len(nrow(bird_ilr))) {
+    combo <- as.character(bird_ilr$combo[i])
+    ilr1  <- as.numeric(bird_ilr$ilr1[i])
+    ilr2  <- as.numeric(bird_ilr$ilr2[i])
+
+    log_msg("BIRDS | combo=", combo)
+
+    run_one_scenario(
+      masses_g   = bird_mass,
+      sampler    = bird_sampler_factory(ilr1, ilr2),
+      out_file   = birds_out,
+      crn_ctx    = CRN_CTX,
+      combo      = combo,
+      append     = TRUE
+    )
+  }
+
+  log_msg("BIRDS | wrote:", birds_out)
+  log_msg("BIRDS | done")
+}
+```

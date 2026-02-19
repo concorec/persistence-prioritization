@@ -1,0 +1,717 @@
+
+
+---
+title: "8_removal_step_mask_verification"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(terra)
+  library(data.table)
+})
+
+# ============================================================
+# EXPENSIVE CHUNK:
+#   - Load alive0 + final_alive
+#   - Discover/order removed_mask_*.tif
+#   - Scan all masks in chunks to verify:
+#       (1) masks are mutually disjoint (no overlaps)
+#       (2) masks only remove alive0 cells (no "extra")
+#       (3) final_alive cells are not removed by any mask
+#       (4) alive0 == removed_union + final_alive (partition identity)
+#   - Also writes a TEMPORARY removal_step GeoTIFF to avoid rescanning later.
+# ============================================================
+
+# -----------------------------
+# Paths (inputs)
+# -----------------------------
+out_dir   <- file.path("Spatial", "Outputs")
+init_path <- file.path("Spatial", "global_orchestrator_init.rds")
+stopifnot(dir.exists(out_dir), file.exists(init_path))
+
+# -----------------------------
+# Initial alive mask (vector) + template
+# -----------------------------
+init <- readRDS(init_path)
+stopifnot(!is.null(init$count_alive), !is.null(init$patch_stack_file), file.exists(init$patch_stack_file))
+
+template <- terra::rast(init$patch_stack_file)[[1]]
+stopifnot(length(init$count_alive) == terra::ncell(template))
+
+alive0 <- as.integer(init$count_alive) > 0L
+rm(init); gc(FALSE)
+
+# -----------------------------
+# Helpers: pick latest global_state + infer final_alive
+# -----------------------------
+pick_latest_global_state <- function(stage_dirs = c(out_dir, "Spatial")) {
+  gs_files <- unlist(lapply(stage_dirs, function(d) {
+    if (!dir.exists(d)) return(character())
+    list.files(d, pattern = "^global_state_stage_[0-9]{4}\\.rds$", full.names = TRUE)
+  }), use.names = FALSE)
+
+  gs_files <- gs_files[file.exists(gs_files)]
+  if (!length(gs_files)) return(NA_character_)
+
+  gdt <- data.table(path = gs_files, base = basename(gs_files))
+  gdt[, stage := as.integer(sub("^global_state_stage_([0-9]{4})\\.rds$", "\\1", base))]
+  setorder(gdt, -stage)
+  gdt$path[1]
+}
+
+infer_final_alive <- function(gs, template) {
+  if (!is.null(gs$count_alive) && length(gs$count_alive) == terra::ncell(template)) {
+    return(as.integer(gs$count_alive) > 0L)
+  }
+
+  possible_paths <- c(
+    gs$alive_mask_file, gs$alive_mask_path, gs$alive_file, gs$final_alive_mask_file,
+    gs$mask_alive_file, gs$alive_mask_tif
+  )
+  possible_paths <- possible_paths[!vapply(possible_paths, is.null, logical(1))]
+  possible_paths <- possible_paths[file.exists(possible_paths)][1]
+
+  if (!is.na(possible_paths)) {
+    r <- terra::rast(possible_paths)
+    if (!terra::compareGeom(template, r, stopOnError = FALSE)) {
+      stop("Geometry mismatch: template vs alive raster from global_state.")
+    }
+    v <- terra::values(r, mat = FALSE)
+    return(!is.na(v) & (v != 0))
+  }
+
+  for (nm in c("alive", "alive_mask", "final_alive", "alive_vec")) {
+    if (!is.null(gs[[nm]]) && length(gs[[nm]]) == terra::ncell(template)) {
+      v <- gs[[nm]]
+      return(!is.na(v) & (as.integer(v) != 0))
+    }
+  }
+
+  stop("Could not infer final alive from global_state (no recognized fields).")
+}
+
+# -----------------------------
+# Final alive from latest global_state
+# -----------------------------
+gs_path <- pick_latest_global_state()
+if (is.na(gs_path)) {
+  stop("Could not find any global_state_stage_####.rds in Spatial/Outputs or Spatial/.", call. = FALSE)
+}
+gs <- readRDS(gs_path)
+final_alive <- infer_final_alive(gs, template)
+rm(gs); gc(FALSE)
+
+final_extra <- sum(final_alive & !alive0)
+if (final_extra > 0) {
+  stop("FAIL: final_alive contains cells not alive in alive0. Count = ", final_extra, call. = FALSE)
+}
+
+cat("\nDetected latest global_state:\n  ", gs_path, "\n", sep = "")
+cat("initial alive0 cells:", sum(alive0), "\n")
+cat("final alive01 cells :", sum(final_alive), "\n")
+
+# -----------------------------
+# Discover + order removed_mask files
+# -----------------------------
+mask_files <- list.files(out_dir, pattern = "^removed_mask_.*\\.tif$", full.names = TRUE)
+stopifnot(length(mask_files) > 0L)
+
+dt <- data.table(file = mask_files, base = basename(mask_files))
+dt[, c("type", "stage", "iter") := .(NA_character_, NA_integer_, NA_integer_)]
+
+i <- grepl("^removed_mask_pruning_stage_[0-9]{4}_iter_[0-9]{3}\\.tif$", dt$base)
+dt[i, `:=`(
+  type  = "pruning",
+  stage = as.integer(sub("^removed_mask_pruning_stage_([0-9]{4})_iter_[0-9]{3}\\.tif$", "\\1", base)),
+  iter  = as.integer(sub("^removed_mask_pruning_stage_[0-9]{4}_iter_([0-9]{3})\\.tif$", "\\1", base))
+)]
+
+i <- grepl("^removed_mask_fragmentation_stage_[0-9]{4}.*\\.tif$", dt$base)
+dt[i, `:=`(
+  type  = "fragmentation",
+  stage = as.integer(sub("^removed_mask_fragmentation_stage_([0-9]{4}).*\\.tif$", "\\1", base)),
+  iter  = 0L
+)]
+
+i <- grepl("^removed_mask_distance_stage_[0-9]{4}\\.tif$", dt$base)
+dt[i, `:=`(
+  type  = "distance",
+  stage = as.integer(sub("^removed_mask_distance_stage_([0-9]{4})\\.tif$", "\\1", base)),
+  iter  = 0L
+)]
+
+dt[is.na(type),  type  := "other"]
+dt[is.na(stage), stage := 999999L]
+dt[is.na(iter),  iter  := 0L]
+
+type_rank <- c(pruning = 1L, fragmentation = 2L, distance = 3L, other = 99L)
+dt[, type_rank := type_rank[type]]
+
+setorder(dt, stage, type_rank, iter, base)
+dt[, step := .I]
+
+cat("\nRemoved-mask files in chronological order:\n")
+print(dt[, .(step, type, stage, iter, base)])
+
+# -----------------------------
+# Load masks (lazy stack) + geometry checks
+# -----------------------------
+mask_stack <- terra::rast(dt$file)
+names(mask_stack) <- sprintf("%04d_%s_%03d", dt$stage, dt$type, dt$iter)
+
+for (k in 1:terra::nlyr(mask_stack)) {
+  if (!terra::compareGeom(template, mask_stack[[k]], stopOnError = FALSE)) {
+    stop("Geometry mismatch between template and mask: ", dt$file[k], call. = FALSE)
+  }
+}
+
+# -----------------------------
+# Expensive scan: verify + build TEMP removal_step
+# -----------------------------
+L         <- terra::nlyr(mask_stack)
+kept_step <- L + 1L
+
+nrows_tot <- terra::nrow(template)
+ncols     <- terra::ncol(template)
+
+chunk_nrows <- 256L
+use_matrix  <- (L <= 50L)
+
+# Temp output for removal_step (final outputs saved in chunk 2)
+tmp_step_file <- file.path(tempdir(), sprintf("removal_step_tmp_%s.tif", format(Sys.time(), "%Y%m%d_%H%M%S")))
+
+step_dtype <- if (kept_step <= 32767L) "INT2S" else "INT4S"
+gdal_opt   <- c("COMPRESS=DEFLATE", "PREDICTOR=2", "ZLEVEL=6", "TILED=YES", "BIGTIFF=YES")
+
+terra::tmpFiles(orphan = TRUE, remove = TRUE)
+
+terra::readStart(mask_stack)
+on.exit(try(terra::readStop(mask_stack), silent = TRUE), add = TRUE)
+
+step_rast <- terra::rast(template)
+terra::writeStart(step_rast, filename = tmp_step_file, overwrite = TRUE, datatype = step_dtype, gdal = gdal_opt)
+
+# diagnostics
+n_overlap          <- 0
+n_extra            <- 0
+n_missing_nonfinal <- 0
+n_final_removed    <- 0
+
+n_alive0      <- sum(alive0)
+n_final_alive <- sum(final_alive)
+n_removed_from_alive0 <- 0
+
+step_counts_alive0   <- numeric(L)
+step_counts_final_in <- numeric(L)
+
+row <- 1L
+while (row <= nrows_tot) {
+  cat("row =", row, "\n")
+  nrows <- min(chunk_nrows, nrows_tot - row + 1L)
+  ncell_block <- nrows * ncols
+
+  start_cell <- (row - 1L) * ncols + 1L
+  end_cell   <- start_cell + ncell_block - 1L
+
+  alive_blk <- alive0[start_cell:end_cell]
+  final_blk <- final_alive[start_cell:end_cell]
+
+  if (use_matrix) {
+    v <- terra::readValues(mask_stack, row = row, nrows = nrows, mat = TRUE)
+    pres <- !is.na(v) & (v != 0)
+    cnt  <- rowSums(pres)
+
+    removed_blk <- cnt > 0L
+    first_idx   <- max.col(pres, ties.method = "first")
+    first_blk   <- ifelse(removed_blk, first_idx, NA_integer_)
+
+    if (any(alive_blk)) {
+      idx <- which(alive_blk)
+      step_counts_alive0 <- step_counts_alive0 + as.numeric(colSums(pres[idx, , drop = FALSE]))
+    }
+    if (any(final_blk)) {
+      idxf <- which(final_blk)
+      step_counts_final_in <- step_counts_final_in + as.numeric(colSums(pres[idxf, , drop = FALSE]))
+    }
+
+  } else {
+    cnt       <- numeric(ncell_block)
+    first_blk <- rep.int(NA_integer_, ncell_block)
+
+    layer_batch <- 20L
+    for (l0 in seq.int(1L, L, by = layer_batch)) {
+      l1 <- min(L, l0 + layer_batch - 1L)
+
+      vv <- terra::readValues(mask_stack[[l0:l1]], row = row, nrows = nrows, mat = TRUE)
+      pres <- !is.na(vv) & (vv != 0)
+      if (!any(pres)) next
+
+      cnt <- cnt + rowSums(pres)
+
+      any_in_row <- rowSums(pres) > 0L
+      need_first <- is.na(first_blk) & any_in_row
+      if (any(need_first)) {
+        idx <- max.col(pres, ties.method = "first")
+        first_blk[need_first] <- (l0 - 1L) + idx[need_first]
+      }
+
+      if (any(alive_blk)) {
+        idx_alive <- which(alive_blk)
+        step_counts_alive0[l0:l1] <- step_counts_alive0[l0:l1] +
+          as.numeric(colSums(pres[idx_alive, , drop = FALSE]))
+      }
+      if (any(final_blk)) {
+        idx_final <- which(final_blk)
+        step_counts_final_in[l0:l1] <- step_counts_final_in[l0:l1] +
+          as.numeric(colSums(pres[idx_final, , drop = FALSE]))
+      }
+    }
+
+    removed_blk <- cnt > 0
+  }
+
+  # diagnostics
+  n_overlap <- n_overlap + sum(cnt > 1)
+  n_extra   <- n_extra   + sum(!alive_blk & removed_blk)
+
+  n_removed_from_alive0 <- n_removed_from_alive0 + sum(alive_blk & removed_blk)
+  n_missing_nonfinal <- n_missing_nonfinal + sum(alive_blk & !final_blk & !removed_blk)
+  n_final_removed <- n_final_removed + sum(final_blk & removed_blk)
+
+  # step values
+  step_vals <- first_blk
+  step_vals[cnt > 1] <- NA_integer_
+
+  keep_cells <- alive_blk & final_blk & !removed_blk
+  step_vals[keep_cells] <- kept_step
+
+  bad_final <- final_blk & removed_blk
+  step_vals[bad_final] <- NA_integer_
+
+  terra::writeValues(step_rast, step_vals, start = row, nrows = nrows)
+  row <- row + nrows
+}
+
+terra::writeStop(step_rast)
+
+# -----------------------------
+# Hard checks (the whole point of this expensive chunk)
+# -----------------------------
+cat("\n=== removed_mask + final-alive verification summary ===\n")
+cat("removed_mask layers:", L, "\n")
+cat("kept_step value   :", kept_step, "\n")
+cat("initial alive0    :", n_alive0, "\n")
+cat("final alive01     :", n_final_alive, "\n")
+cat("removed from alive0 (union):", n_removed_from_alive0, "\n")
+cat("overlap cells (count>1):", n_overlap, "\n")
+cat("extra cells (removed but initially dead):", n_extra, "\n")
+cat("missing non-final cells (alive0 & !final_alive & never removed):", n_missing_nonfinal, "\n")
+cat("final-alive cells that were removed by some mask:", n_final_removed, "\n")
+cat("sum(step_counts_final_in) (final cells present in masks; should be 0):", sum(step_counts_final_in), "\n")
+cat("TEMP removal_step written to:", tmp_step_file, "\n")
+
+if (n_overlap > 0) stop("FAIL: removed_mask rasters are not disjoint (some cells appear in >1 mask).", call. = FALSE)
+if (n_extra   > 0) stop("FAIL: removed_mask rasters include cells that were not alive initially.", call. = FALSE)
+if (n_final_removed > 0) stop("FAIL: some final-alive cells are included in removed masks.", call. = FALSE)
+if (n_missing_nonfinal > 0) stop("FAIL: some non-final alive0 cells are neither removed nor kept.", call. = FALSE)
+if ((n_removed_from_alive0 + n_final_alive) != n_alive0) {
+  stop("FAIL: partition size mismatch: removed_from_alive0 + final_alive != alive0.", call. = FALSE)
+}
+
+cat("PASS: removed_mask rasters are disjoint and together with final_alive they partition alive0.\n")
+
+# ------------------------------------------------------------
+# Store everything chunk 2 needs (so chunk 2 never rescans)
+# ------------------------------------------------------------
+verify <- list(
+  template      = template,
+  alive0        = alive0,
+  final_alive   = final_alive,
+  gs_path       = gs_path,
+  dt            = copy(dt),
+  L             = L,
+  kept_step     = kept_step,
+  n_alive0      = as.numeric(n_alive0),
+  n_final_alive = as.numeric(n_final_alive),
+  step_counts_alive0   = step_counts_alive0,
+  step_counts_final_in = step_counts_final_in,
+  tmp_step_file = tmp_step_file
+)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(terra)
+  library(data.table)
+  library(stringr)
+})
+
+stopifnot(exists("verify"))
+
+# ============================================================
+# OUTPUT CHUNK (no expensive rescan):
+# Writes ALL outputs your full Rmd currently produces into:
+#   Spatial/Outputs/removal_step_mask_verification/
+# ============================================================
+
+out_root <- file.path("Spatial", "Outputs", "removal_step_mask_verification")
+dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------
+# Helper: move/copy GeoTIFF "family" (sidecars too)
+# -----------------------------
+move_or_copy_geotiff_family <- function(from, to) {
+  sidecars <- c("", ".aux.xml", ".ovr", ".xml", ".tfw")
+  ok <- TRUE
+
+  for (s in sidecars) {
+    ff <- paste0(from, s)
+    tt <- paste0(to,   s)
+    if (!file.exists(ff)) next
+
+    if (file.exists(tt)) unlink(tt, force = TRUE)
+
+    # try rename first (fast), then copy+delete if needed
+    moved <- file.rename(ff, tt)
+    if (!moved) {
+      copied <- file.copy(ff, tt, overwrite = TRUE)
+      if (copied) unlink(ff, force = TRUE)
+      moved <- copied
+    }
+    ok <- ok && moved
+  }
+  ok
+}
+
+# -----------------------------
+# 1) Save removal_step.tif (from temp) into out_root
+# -----------------------------
+step_path <- file.path(out_root, "removal_step.tif")
+ok <- move_or_copy_geotiff_family(verify$tmp_step_file, step_path)
+if (!ok) stop("Could not move/copy temporary removal_step GeoTIFF family into: ", step_path, call. = FALSE)
+
+removal_step <- terra::rast(step_path)  # handle for later steps
+
+# -----------------------------
+# 2) Save per-step removal tables (counts + partition)
+# -----------------------------
+dt <- copy(verify$dt)
+L  <- verify$L
+
+removal_counts <- dt[, .(step, type, stage, iter, base)]
+removal_counts[, cells_removed := as.numeric(verify$step_counts_alive0)]
+removal_counts[, cum_removed   := cumsum(cells_removed)]
+removal_counts[, `:=`(
+  alive0_cells      = verify$n_alive0,
+  final_alive_cells = verify$n_final_alive
+)]
+
+counts_path <- file.path(out_root, "removal_counts_by_step.csv")
+fwrite(removal_counts, counts_path)
+
+partition_counts <- rbind(
+  removal_counts[, .(step, type, stage, iter, base,
+                     cells = cells_removed,
+                     role  = "removed")],
+  data.table(step = verify$kept_step, type = "final_alive", stage = NA_integer_, iter = NA_integer_,
+             base = "final_alive_state",
+             cells = verify$n_final_alive,
+             role  = "kept")
+)
+partition_counts[, cum_removed := fifelse(role == "removed", cumsum(cells), max(removal_counts$cum_removed, 0))]
+partition_path <- file.path(out_root, "partition_counts_including_final_alive.csv")
+fwrite(partition_counts, partition_path)
+
+# -----------------------------
+# 3) Add % columns table (the "with pct" CSV)
+# -----------------------------
+alive0_total <- as.numeric(unique(removal_counts$alive0_cells))
+stopifnot(length(alive0_total) == 1L, is.finite(alive0_total), alive0_total > 0)
+
+pct_table <- copy(removal_counts)
+pct_table[, `:=`(
+  pct_removed_step = 100 * (cells_removed / alive0_total),
+  pct_removed_cum  = 100 * (cum_removed   / alive0_total)
+)]
+
+pct_path <- file.path(out_root, "removal_counts_by_step_with_pct.csv")
+fwrite(pct_table, pct_path)
+
+# -----------------------------
+# 4) Mean species persistence by stage (q50/q16/q025)
+# -----------------------------
+init_path <- file.path("Spatial", "global_orchestrator_init.rds")
+stopifnot(file.exists(init_path))
+init <- readRDS(init_path)
+
+stopifnot(!is.null(init$patch_stack_file), file.exists(init$patch_stack_file))
+species_all <- names(terra::rast(init$patch_stack_file))
+if (!length(species_all)) stop("Could not read species names from init$patch_stack_file.")
+
+species_csv <- init$meta$species_csv
+if (is.null(species_csv) || !file.exists(species_csv)) {
+  species_csv <- file.path("Data", "Clean", "species_table.csv")
+}
+stopifnot(file.exists(species_csv))
+
+species_id_from_scientific <- function(sci) {
+  x <- stringr::str_squish(as.character(sci))
+  x <- stringr::str_replace_all(x, "\\s+", "_")
+  x <- stringr::str_replace_all(x, "[/\\\\:<>\"|?*]+", "_")
+  x <- stringr::str_replace_all(x, "[^A-Za-z0-9_]+", "_")
+  x <- stringr::str_replace_all(x, "_+", "_")
+  x <- stringr::str_replace_all(x, "^_|_$", "")
+  x
+}
+
+build_params_for_curve <- function(sp0, curve = c("q50","q16","q025")) {
+  curve <- match.arg(curve)
+  alpha_col <- paste0("alpha_", curve)
+  beta_col  <- paste0("beta_",  curve)
+
+  need_cols <- c("scientificName", "className",
+                 "density", "dispersal_dist",
+                 "min_patch_size", "min_pop_size",
+                 alpha_col, beta_col)
+  missing_cols <- setdiff(need_cols, names(sp0))
+  if (length(missing_cols)) stop("species_table.csv missing columns for curve=", curve, ": ", paste(missing_cols, collapse=", "))
+
+  sp0[, class_lc := tolower(trimws(as.character(className)))]
+
+  include_mammals <- isTRUE(init$meta$include_mammals)
+  include_birds   <- isTRUE(init$meta$include_birds)
+
+  keep_tax <- (include_mammals & sp0$class_lc == "mammalia") |
+              (include_birds   & sp0$class_lc == "aves")
+  sp <- sp0[keep_tax]
+  if (!nrow(sp)) stop("No rows remain after taxon gating for curve=", curve)
+
+  sp[, species := species_id_from_scientific(scientificName)]
+
+  params <- sp[, .(
+    species           = as.character(species),
+    min_patch_size    = as.numeric(min_patch_size),
+    min_patch_size500 = as.numeric(min_pop_size), # pipeline mapping
+    a_pred            = as.numeric(get(alpha_col)),
+    b_pred            = as.numeric(get(beta_col)),
+    density           = as.numeric(density),
+    dispersal_dist    = as.numeric(dispersal_dist)
+  )]
+
+  if (any(!nzchar(params$species))) stop("Empty species IDs after sanitization (curve=", curve, ").")
+  if (anyDuplicated(params$species)) stop("Duplicate species IDs after sanitization (curve=", curve, ").")
+
+  bad <- which(!is.finite(params$a_pred) | !is.finite(params$b_pred) | params$a_pred <= 0 | params$b_pred <= 0)
+  if (length(bad)) stop("Non-finite/non-positive Gompertz params for ", length(bad), " species (curve=", curve, ").")
+
+  setkey(params, species)
+  params
+}
+
+.compute_species_persistence <- function(patch_dt_stage, params, species_all) {
+  patch_dt_stage <- as.data.table(patch_dt_stage)
+  params         <- as.data.table(params)
+
+  pu_dt <- patch_dt_stage[, .(pu_area_km2 = sum(patch_area_km2, na.rm = TRUE)), by = .(species, pu_id)]
+  if (!nrow(pu_dt)) return(data.table(species = species_all, persistence = 0))
+
+  pu_dt <- params[pu_dt, on = .(species)]
+  delta <- pu_dt$pu_area_km2 - pu_dt$min_patch_size500
+
+  ok <- is.finite(delta) & delta > 0 &
+        is.finite(pu_dt$density) & pu_dt$density > 0 &
+        is.finite(pu_dt$a_pred) & pu_dt$a_pred > 0 &
+        is.finite(pu_dt$b_pred) & pu_dt$b_pred > 0
+
+  P_pu <- numeric(nrow(pu_dt))
+  if (any(ok)) {
+    y <- log(pu_dt$a_pred[ok]) -
+      pu_dt$b_pred[ok] * log(pu_dt$density[ok]) -
+      pu_dt$b_pred[ok] * log(delta[ok])
+    P_pu[ok] <- exp(-exp(y))
+  }
+  pu_dt[, P_pu := P_pu]
+
+  sp_dt <- pu_dt[, .(sum_log1mP = sum(log1p(-P_pu), na.rm = TRUE)), by = .(species)]
+  sp_dt[, persistence := -expm1(sum_log1mP)]
+  sp_dt <- sp_dt[, .(species, persistence)]
+
+  out <- data.table(species = species_all)[sp_dt, on = "species"]
+  out[is.na(persistence), persistence := 0]
+  out[]
+}
+
+persistence_by_stage_multi_curve <- function(params_by_curve, stage_dirs = c(file.path("Spatial","Outputs"), "Spatial")) {
+  gs_files <- unlist(lapply(stage_dirs, function(d) {
+    if (!dir.exists(d)) return(character())
+    list.files(d, pattern = "^global_state_stage_[0-9]{4}\\.rds$", full.names = TRUE)
+  }), use.names = FALSE)
+  gs_files <- gs_files[file.exists(gs_files)]
+  if (!length(gs_files)) stop("No global_state_stage_####.rds files found.")
+
+  gs_dt <- data.table(path = gs_files, base = basename(gs_files))
+  gs_dt[, stage := as.integer(sub("^global_state_stage_([0-9]{4})\\.rds$", "\\1", base))]
+  setorder(gs_dt, stage)
+
+  out_list <- list()
+  for (curve in names(params_by_curve)) {
+    params <- params_by_curve[[curve]]
+
+    stage_rows <- vector("list", nrow(gs_dt))
+    for (i in seq_len(nrow(gs_dt))) {
+      gs <- readRDS(gs_dt$path[i])
+      if (is.null(gs$patch_dt)) stop("Missing $patch_dt in: ", gs_dt$path[i])
+
+      sp_persist <- .compute_species_persistence(gs$patch_dt, params, species_all)
+
+      stage_rows[[i]] <- sp_persist[, .(
+        curve             = curve,
+        stage             = gs_dt$stage[i],
+        n_species_total    = length(species_all),
+        n_species_present  = sum(persistence > 0),
+        mean_persistence   = mean(persistence),
+        median_persistence = median(persistence),
+        min_persistence    = min(persistence),
+        max_persistence    = max(persistence)
+      )]
+
+      rm(gs); gc(FALSE)
+    }
+    out_list[[curve]] <- rbindlist(stage_rows, use.names = TRUE)
+  }
+
+  rbindlist(out_list, use.names = TRUE)
+}
+
+sp0 <- fread(species_csv)
+
+params_by_curve <- list(
+  q50  = build_params_for_curve(sp0, "q50"),
+  q16  = build_params_for_curve(sp0, "q16"),
+  q025 = build_params_for_curve(sp0, "q025")
+)
+
+stage_summary_all <- persistence_by_stage_multi_curve(params_by_curve)
+
+persist_path <- file.path(out_root, "mean_species_persistence_by_stage_q50_q16_q025.csv")
+fwrite(stage_summary_all, persist_path)
+
+# -----------------------------
+# 5) Plot: mean persistence vs cumulative % removed (stage-end)
+# -----------------------------
+# Stage-end cumulative % removed
+x_stage <- pct_table[, .(pct_removed_cum = max(pct_removed_cum, na.rm = TRUE)), by = .(stage)]
+setorder(x_stage, stage)
+
+ps <- stage_summary_all[, .(curve, stage, mean_persistence)]
+ps <- unique(ps)
+
+plot_dt <- merge(ps, x_stage, by = "stage", all = FALSE)
+stopifnot(nrow(plot_dt) > 0)
+
+curve_cols <- c(q50 = "blue3", q16 = "darkorange2", q025 = "forestgreen")
+curves <- c("q50","q16","q025")
+plot_dt <- plot_dt[curve %in% curves]
+setorder(plot_dt, curve, pct_removed_cum, stage)
+
+xlim <- range(plot_dt$pct_removed_cum, finite = TRUE)
+ylim <- range(plot_dt$mean_persistence, finite = TRUE)
+
+png_path <- file.path(out_root, "mean_persistence_vs_cum_removed_q50_q16_q025.png")
+png(png_path, width = 1200, height = 800)
+plot(NA,
+     xlim = xlim, ylim = ylim,
+     xlab = "Cumulative % of initially-alive cells removed",
+     ylab = "Mean species persistence probability",
+     main = "Mean persistence vs cumulative habitat removal (q50, q16, q025)")
+for (cv in curves) {
+  d <- plot_dt[curve == cv]
+  if (!nrow(d)) next
+  lines(d$pct_removed_cum, d$mean_persistence, type = "b", col = curve_cols[[cv]], pch = 16)
+}
+legend("bottomleft", legend = curves, col = curve_cols[curves], lty = 1, pch = 16, bty = "n")
+dev.off()
+
+# -----------------------------
+# 6) Removal-order masks + lookup
+# -----------------------------
+# (We wrote counts_path inside out_root)
+counts_path <- file.path(out_root, "removal_counts_by_step.csv")
+rc <- fread(counts_path)
+setorder(rc, step)
+
+alive0_total <- as.numeric(unique(rc$alive0_cells))
+stopifnot(length(alive0_total) == 1L, is.finite(alive0_total), alive0_total > 0)
+
+rc[, pct_removed_cum := 100 * (cum_removed / alive0_total)]
+kept_step <- max(rc$step, na.rm = TRUE) + 1L
+
+# step -> cumulative % (kept cells = 100%)
+from_steps_pct <- c(rc$step, kept_step)
+to_steps_pct   <- c(rc$pct_removed_cum, 100)
+
+# step -> stage:
+#   - convert 999999 ("other") to NA
+#   - kept_step maps to LAST REAL STAGE (instead of 0)
+stage_mapped <- as.integer(rc$stage)
+stage_mapped[stage_mapped == 999999L] <- NA_integer_
+
+last_stage <- suppressWarnings(max(stage_mapped, na.rm = TRUE))
+stopifnot(is.finite(last_stage))
+
+from_steps_stage <- c(rc$step, kept_step)
+to_steps_stage   <- c(stage_mapped, as.integer(last_stage))
+
+pct_mask <- terra::subst(removal_step, from = from_steps_pct,   to = to_steps_pct,   others = NA_real_)
+stg_mask <- terra::subst(removal_step, from = from_steps_stage, to = to_steps_stage, others = NA_integer_)
+
+gdal_opt <- c("COMPRESS=DEFLATE", "PREDICTOR=2", "ZLEVEL=6", "TILED=YES", "BIGTIFF=IF_SAFER")
+
+pct_mask_path <- file.path(out_root, "removal_cum_pct_at_step.tif")
+stg_mask_path <- file.path(out_root, "removal_stage_at_step.tif")
+
+terra::writeRaster(pct_mask, pct_mask_path, overwrite = TRUE, wopt = list(datatype = "FLT4S", gdal = gdal_opt))
+terra::writeRaster(stg_mask, stg_mask_path, overwrite = TRUE, wopt = list(datatype = "INT2S", gdal = gdal_opt))
+
+# Lookup table (note: keep stage now = last_stage; pct=100 for kept)
+lut <- rc[, .(step, type, stage = stage_mapped, pct_removed_cum)]
+lut <- rbind(lut, data.table(step = kept_step, type = "final_alive", stage = as.integer(last_stage), pct_removed_cum = 100))
+lut_path <- file.path(out_root, "removal_step_to_pct_and_stage_lookup.csv")
+fwrite(lut, lut_path)
+
+# -----------------------------
+# Report outputs
+# -----------------------------
+cat("\nWROTE OUTPUTS TO:\n  ", out_root, "\n", sep = "")
+cat("  removal_step.tif\n")
+cat("  removal_counts_by_step.csv\n")
+cat("  partition_counts_including_final_alive.csv\n")
+cat("  removal_counts_by_step_with_pct.csv\n")
+cat("  mean_species_persistence_by_stage_q50_q16_q025.csv\n")
+cat("  mean_persistence_vs_cum_removed_q50_q16_q025.png\n")
+cat("  removal_cum_pct_at_step.tif\n")
+cat("  removal_stage_at_step.tif\n")
+cat("  removal_step_to_pct_and_stage_lookup.csv\n\n")
+```
+
+```{r}
+library(terra)
+
+out_root <- file.path("Spatial", "Outputs", "removal_step_mask_verification")
+
+rs  <- rast(file.path(out_root, "removal_step.tif"))
+rp  <- rast(file.path(out_root, "removal_cum_pct_at_step.tif"))
+rst <- rast(file.path(out_root, "removal_stage_at_step.tif"))
+
+# Geometry identical?
+stopifnot(compareGeom(rs, rp,  stopOnError = FALSE),
+          compareGeom(rs, rst, stopOnError = FALSE))
+
+# NA-pattern identical?
+mismatch_rs_rp  <- global(is.na(rs) != is.na(rp),  "sum", na.rm = TRUE)[1,1]
+mismatch_rs_rst <- global(is.na(rs) != is.na(rst), "sum", na.rm = TRUE)[1,1]
+
+cat("NA mismatches (removal_step vs cum_pct):", mismatch_rs_rp,  "\n")
+cat("NA mismatches (removal_step vs stage)  :", mismatch_rs_rst, "\n")
+```

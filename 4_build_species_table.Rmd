@@ -1,0 +1,1058 @@
+
+
+---
+title: "4_build_species_table"
+output: html_document
+---
+
+```{r}
+## ---- sanity_precondition_validation_checks ---------------------------------
+## The ONLY place in this Rmd where we validate.
+## Everything below assumes these checks passed.
+
+# =============================================================================
+# 0) Tiny assertion helpers (keep these tiny + explicit)
+# =============================================================================
+assert <- function(ok, msg) if (!isTRUE(ok)) stop(msg, call. = FALSE)
+
+need_file <- function(path, label = path) {
+  assert(file.exists(path), paste0("Missing file: ", label, "\nPath: ", path))
+}
+need_dir <- function(path, label = path) {
+  assert(dir.exists(path), paste0("Missing directory: ", label, "\nPath: ", path))
+}
+
+# =============================================================================
+# 1) User switches
+#    - These TWO flags independently control whether Gompertz values are filled.
+#    - Even when FALSE, alpha_*/beta_* columns will still exist downstream (all NA).
+# =============================================================================
+DO_GOMPERTZ_MAMMALS <- TRUE
+DO_GOMPERTZ_BIRDS   <- FALSE
+CURVES              <- c("q50", "q16", "q025")
+
+DO_ANY_GOMPERTZ <- isTRUE(DO_GOMPERTZ_MAMMALS) || isTRUE(DO_GOMPERTZ_BIRDS)
+
+# =============================================================================
+# 2) Packages (IUCN habitats are ALWAYS queried in this script)
+# =============================================================================
+pkgs <- c("readr", "dplyr", "stringr", "tools", "tibble", "rredlist")
+miss <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+assert(length(miss) == 0, paste0("Missing package(s): ", paste(miss, collapse = ", ")))
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(stringr)
+  library(tools)
+  library(tibble)
+  library(rredlist)
+})
+
+# IUCN API key is required because habitat retrieval is NOT optional.
+assert(
+  nzchar(Sys.getenv("IUCN_REDLIST_KEY")),
+  "IUCN_REDLIST_KEY is not set in your environment (required for IUCN habitat queries)."
+)
+
+# =============================================================================
+# 3) Paths (centralized)
+# =============================================================================
+RAW_DIR   <- "Data/Raw"
+CLEAN_DIR <- "Data/Clean"
+
+paths <- list(
+  # Raw inputs
+  summary_csv    = file.path(RAW_DIR, "simple_summary.csv"),
+  synonyms       = file.path(RAW_DIR, "synonyms.csv"),
+  mammal_raw     = file.path(RAW_DIR, "mammal_data.txt"),
+  bird_raw       = file.path(RAW_DIR, "bird_data.txt"),
+  random_effects = file.path(RAW_DIR, "random_effects.csv"),
+
+  # Presence rasters (working directory)
+  mammal_dir     = "mammal_ppm_bin",
+  bird_dir       = "bird_ppm_bin",
+
+  # Models (only required if any Gompertz flag is TRUE)
+  loess_rds      = file.path(CLEAN_DIR, "gompertz_loess_models.rds"),
+
+  # Single canonical output
+  out_csv        = file.path(CLEAN_DIR, "species_table.csv")
+)
+
+# Ensure output directory exists (this is setup, not “validation logic” elsewhere)
+if (!dir.exists(CLEAN_DIR)) dir.create(CLEAN_DIR, recursive = TRUE, showWarnings = FALSE)
+need_dir(CLEAN_DIR, "Data/Clean (output directory)")
+
+# =============================================================================
+# 4) Switch sanity
+# =============================================================================
+assert(is.logical(DO_GOMPERTZ_MAMMALS) && length(DO_GOMPERTZ_MAMMALS) == 1, "DO_GOMPERTZ_MAMMALS must be TRUE/FALSE.")
+assert(is.logical(DO_GOMPERTZ_BIRDS)   && length(DO_GOMPERTZ_BIRDS)   == 1, "DO_GOMPERTZ_BIRDS must be TRUE/FALSE.")
+assert(
+  is.character(CURVES) && length(CURVES) > 0 && all(CURVES %in% c("q50", "q16", "q025")),
+  "CURVES must be a non-empty subset of c('q50','q16','q025')."
+)
+
+# =============================================================================
+# 5) Input existence checks (fail fast)
+# =============================================================================
+need_file(paths$summary_csv,    "Data/Raw/simple_summary.csv")
+need_file(paths$synonyms,       "Data/Raw/synonyms.csv")
+need_file(paths$mammal_raw,     "Data/Raw/mammal_data.txt")
+need_file(paths$bird_raw,       "Data/Raw/bird_data.txt")
+need_file(paths$random_effects, "Data/Raw/random_effects.csv")
+need_dir(paths$mammal_dir,      "mammal_ppm_bin (presence rasters)")
+need_dir(paths$bird_dir,        "bird_ppm_bin (presence rasters)")
+
+# =============================================================================
+# 6) Minimal header checks
+# =============================================================================
+
+# ---- summary: must include keys for (a) matching, (b) random effects joins, (c) IUCN API queries
+hdr_sum <- readr::read_csv(paths$summary_csv, show_col_types = FALSE, n_max = 0)
+
+need_sum <- c(
+  "scientificName",   # primary species key used throughout
+  "className",        # Mammalia/Aves gating + auditing
+  "orderName", "familyName",   # random-effects joins
+  "genusName", "speciesName",  # IUCN API query inputs
+  "redlistCategory"            # required output/audit column
+)
+
+missing_sum <- setdiff(need_sum, names(hdr_sum))
+assert(
+  length(missing_sum) == 0,
+  paste0("simple_summary.csv is missing required column(s): ", paste(missing_sum, collapse = ", "))
+)
+
+# ---- synonyms: join key + genus/species to construct synonym candidates
+hdr_syn <- tryCatch(
+  readr::read_csv(paths$synonyms, show_col_types = FALSE, n_max = 0),
+  error = function(e) readr::read_delim(paths$synonyms, delim = "\t", show_col_types = FALSE, n_max = 0)
+)
+need_syn <- c("scientificName", "genusName", "speciesName")
+missing_syn <- setdiff(need_syn, names(hdr_syn))
+assert(
+  length(missing_syn) == 0,
+  paste0("synonyms file is missing required column(s): ", paste(missing_syn, collapse = ", "))
+)
+
+# =============================================================================
+# 7) Quick content sanity checks (still lightweight)
+# =============================================================================
+# We intentionally read only a few columns to keep this fast.
+sum_min <- readr::read_csv(
+  paths$summary_csv,
+  show_col_types = FALSE,
+  progress = FALSE,
+  col_select = dplyr::all_of(c("className", "genusName", "speciesName"))
+)
+
+# ---- Detect taxa present (used to gate some validations)
+cls <- stringr::str_squish(tolower(as.character(sum_min$className)))
+HAS_MAMMAL_ROWS <- any(cls == "mammalia", na.rm = TRUE)
+HAS_BIRD_ROWS   <- any(cls == "aves",     na.rm = TRUE)
+
+# ---- Ensure each row has a (genusName, speciesName) pair (required for IUCN API calls)
+gn <- stringr::str_squish(as.character(sum_min$genusName))
+sn <- stringr::str_squish(as.character(sum_min$speciesName))
+assert(
+  all(nzchar(gn) & nzchar(sn)),
+  "simple_summary.csv has missing/empty genusName or speciesName (required for IUCN API queries)."
+)
+
+# Optional-but-cheap: verify your stated invariant (unique genus/species per row)
+dup_pair <- duplicated(paste0(tolower(gn), "||", tolower(sn)))
+assert(
+  !any(dup_pair),
+  "simple_summary.csv has duplicated (genusName, speciesName) pairs (expected unique per row)."
+)
+
+# =============================================================================
+# 8) Trait file header checks (we read traits as character later)
+# =============================================================================
+get_trait_hdr <- function(path, label) {
+  hdr <- trimws(strsplit(readLines(path, n = 1, warn = FALSE), "\t", fixed = TRUE)[[1]])
+  assert("Scientific" %in% hdr,     paste0(label, " must contain column: Scientific\nPath: ", path))
+  assert("BodyMass-Value" %in% hdr, paste0(label, " must contain column: BodyMass-Value\nPath: ", path))
+  hdr
+}
+hdr_mammal_trait <- get_trait_hdr(paths$mammal_raw, "mammal_data.txt")
+hdr_bird_trait   <- get_trait_hdr(paths$bird_raw,   "bird_data.txt")
+
+# =============================================================================
+# 9) Diet prerequisites for covariates
+#    Covariates require either:
+#      - a Diet.5Cat-like column, OR
+#      - enough Diet-* components to derive aggregates.
+# =============================================================================
+DIET_INV_COL    <- "Diet-Inv"
+DIET_PLANT_COLS <- c("Diet-Fruit", "Diet-Nect", "Diet-Seed", "Diet-PlantO")
+DIET_VERT_COLS  <- c("Diet-Vend", "Diet-Vect", "Diet-Vfish", "Diet-Vunk", "Diet-Scav")
+
+has_diet5cat <- function(hdr) {
+  nm <- tolower(hdr)
+  any(stringr::str_detect(nm, "^diet[._-]?5cat$"))
+}
+
+if (isTRUE(HAS_MAMMAL_ROWS) && !has_diet5cat(hdr_mammal_trait)) {
+  assert(DIET_INV_COL %in% hdr_mammal_trait,
+         paste0("mammal_data.txt is missing required diet column: ", DIET_INV_COL))
+  assert(any(DIET_PLANT_COLS %in% hdr_mammal_trait),
+         paste0("mammal_data.txt must contain at least one plant diet column: ", paste(DIET_PLANT_COLS, collapse = ", ")))
+  assert(any(DIET_VERT_COLS %in% hdr_mammal_trait),
+         paste0("mammal_data.txt must contain at least one vertebrate/scav diet column: ", paste(DIET_VERT_COLS, collapse = ", ")))
+}
+
+if (isTRUE(HAS_BIRD_ROWS) && !has_diet5cat(hdr_bird_trait)) {
+  assert(DIET_INV_COL %in% hdr_bird_trait,
+         paste0("bird_data.txt is missing required diet column: ", DIET_INV_COL))
+  assert(any(DIET_PLANT_COLS %in% hdr_bird_trait),
+         paste0("bird_data.txt must contain at least one plant diet column: ", paste(DIET_PLANT_COLS, collapse = ", ")))
+  assert(any(DIET_VERT_COLS %in% hdr_bird_trait),
+         paste0("bird_data.txt must contain at least one vertebrate/scav diet column: ", paste(DIET_VERT_COLS, collapse = ", ")))
+}
+
+# Bird Gompertz requires Diet-* columns (combo inference uses Diet-* only)
+if (isTRUE(DO_GOMPERTZ_BIRDS)) {
+  bird_diet_cols <- hdr_bird_trait[stringr::str_detect(hdr_bird_trait, "^Diet-")]
+  assert(
+    length(bird_diet_cols) > 0,
+    paste0(
+      "DO_GOMPERTZ_BIRDS=TRUE but bird_data.txt has no Diet-* columns.\n",
+      "Bird combo models are inferred from Diet-* columns only.\n",
+      "Path: ", paths$bird_raw
+    )
+  )
+}
+
+# =============================================================================
+# 10) Random effects header validation (required for mammals + birds covariates)
+# =============================================================================
+hdr_re <- readr::read_csv(paths$random_effects, show_col_types = FALSE, n_max = 0)
+need_re <- c("Class", "Order", "Family", "Species", "Effect_Order", "Effect_Family", "Effect_Species")
+missing_re <- setdiff(need_re, names(hdr_re))
+assert(
+  length(missing_re) == 0,
+  paste0("random_effects.csv is missing required column(s): ", paste(missing_re, collapse = ", "))
+)
+
+# Ensure random effects contain the classes that appear
+re_cls <- readr::read_csv(
+  paths$random_effects,
+  show_col_types = FALSE,
+  progress = FALSE,
+  col_select = dplyr::all_of("Class")
+)$Class
+re_cls <- unique(stringr::str_squish(tolower(as.character(re_cls))))
+
+if (isTRUE(HAS_MAMMAL_ROWS)) assert(any(re_cls == "mammalia"), "random_effects.csv is missing Class == 'Mammalia'.")
+if (isTRUE(HAS_BIRD_ROWS))   assert(any(re_cls == "aves"),     "random_effects.csv is missing Class == 'Aves'.")
+
+# =============================================================================
+# 11) Presence raster sanity (at least one *_bin raster exists)
+# =============================================================================
+count_bin <- function(dir_path) {
+  f <- list.files(dir_path, full.names = FALSE)
+  if (!length(f)) return(0L)
+  stems <- tools::file_path_sans_ext(f) |> stringr::str_to_lower()
+  sum(stringr::str_ends(stems, "_bin"))
+}
+assert(
+  (count_bin(paths$mammal_dir) + count_bin(paths$bird_dir)) > 0,
+  "No '*_bin' rasters found in mammal_ppm_bin or bird_ppm_bin."
+)
+
+# =============================================================================
+# 12) Gompertz LOESS models (only required if any Gompertz flag is TRUE)
+# =============================================================================
+if (isTRUE(DO_ANY_GOMPERTZ)) {
+  need_file(paths$loess_rds, "Data/Clean/gompertz_loess_models.rds")
+
+  m <- readRDS(paths$loess_rds)
+  assert(is.list(m) && all(c("meta", "mammals", "birds") %in% names(m)),
+         "gompertz_loess_models.rds must be a list with elements: meta, mammals, birds")
+
+  if (isTRUE(DO_GOMPERTZ_MAMMALS)) {
+    assert(is.list(m$mammals), "models$mammals is missing or not a list")
+    assert(all(CURVES %in% names(m$mammals)),
+           paste0("Missing mammal curve(s): ", paste(setdiff(CURVES, names(m$mammals)), collapse = ", ")))
+    for (cc in CURVES) {
+      assert(inherits(m$mammals[[cc]]$alpha, "loess"), paste0("mammals[", cc, "]$alpha is not a loess object"))
+      assert(inherits(m$mammals[[cc]]$beta,  "loess"), paste0("mammals[", cc, "]$beta is not a loess object"))
+    }
+  }
+
+  if (isTRUE(DO_GOMPERTZ_BIRDS)) {
+    assert(is.list(m$birds) && length(m$birds) > 0, "Bird Gompertz enabled but models$birds is empty or not a list")
+    for (cb in names(m$birds)) {
+      assert(all(CURVES %in% names(m$birds[[cb]])),
+             paste0("Missing bird curve(s) for combo ", cb, ": ", paste(setdiff(CURVES, names(m$birds[[cb]])), collapse = ", ")))
+      for (cc in CURVES) {
+        assert(inherits(m$birds[[cb]][[cc]]$alpha, "loess"), paste0("birds[", cb, "][", cc, "]$alpha is not a loess object"))
+        assert(inherits(m$birds[[cb]][[cc]]$beta,  "loess"), paste0("birds[", cb, "][", cc, "]$beta is not a loess object"))
+      }
+    }
+  }
+
+  rm(m)
+}
+
+# =============================================================================
+# 13) Success message (single line so logs stay clean)
+# =============================================================================
+message(
+  "Validation OK | DO_GOMPERTZ_MAMMALS=", DO_GOMPERTZ_MAMMALS,
+  " DO_GOMPERTZ_BIRDS=", DO_GOMPERTZ_BIRDS,
+  " | CURVES=", paste(CURVES, collapse = ", "),
+  " | HAS_MAMMALS=", HAS_MAMMAL_ROWS,
+  " HAS_BIRDS=", HAS_BIRD_ROWS,
+  " | output=", paths$out_csv
+)
+```
+
+```{r}
+## ---- helpers_core_no_checks -------------------------------------------------
+## Helper functions ONLY (no validation / sanity checks here).
+## All preconditions are assumed to have been verified in the first chunk.
+
+# =============================================================================
+# 1) Small string utilities (stable join keys)
+# =============================================================================
+
+# Raster filenames in your dirs are "*_bin.tif" etc; this reproduces that stem.
+to_stem <- function(x) {
+  stringr::str_to_lower(
+    paste0(
+      stringr::str_replace_all(stringr::str_squish(x), "\\s+", "_"),
+      "_bin"
+    )
+  )
+}
+
+# General-purpose "join key" cleaner for taxon strings:
+# - trim + collapse whitespace
+# - lowercase
+clean_nm <- function(x) stringr::str_squish(tolower(as.character(x)))
+
+# Numeric parser that tolerates character/numeric inputs and messy strings.
+numify <- function(x) suppressWarnings(readr::parse_number(as.character(x)))
+
+# =============================================================================
+# 2) Readers
+# =============================================================================
+
+# Synonym map: IUCN scientificName -> (genus + species) synonym candidate
+read_synonyms <- function(path) {
+  tryCatch(
+    readr::read_csv(path, show_col_types = FALSE),
+    error = function(e) readr::read_delim(path, delim = "\t", show_col_types = FALSE)
+  ) |>
+    dplyr::transmute(
+      orig = stringr::str_squish(scientificName),
+      syn  = stringr::str_squish(paste(genusName, speciesName))
+    ) |>
+    dplyr::filter(!is.na(orig), nzchar(orig), !is.na(syn), nzchar(syn)) |>
+    dplyr::distinct(orig, syn)
+}
+
+# List "*_bin" raster stems from a directory (no extensions)
+list_raster_stems <- function(dir_path) {
+  list.files(dir_path, full.names = FALSE) |>
+    tools::file_path_sans_ext() |>
+    stringr::str_to_lower() |>
+    (\(x) x[stringr::str_ends(x, "_bin")])()
+}
+
+# Read trait tables as character, then parse BodyMass.Value (grams) and add stable join key.
+read_traits <- function(path, taxon_class) {
+  readr::read_tsv(
+    path,
+    col_types = readr::cols(.default = readr::col_character()),
+    show_col_types = FALSE,
+    progress = FALSE,
+    na = c("", "NA", "NaN", "NULL")
+  ) |>
+    dplyr::mutate(
+      trait_clean    = clean_nm(.data[["Scientific"]]),
+      taxon_class    = taxon_class,
+      BodyMass.Value = numify(.data[["BodyMass-Value"]])  # grams
+    )
+}
+
+# Santini random effects: read + standardize join keys (lowercase + squish)
+read_random_effects <- function(path) {
+  readr::read_csv(path, show_col_types = FALSE) |>
+    dplyr::mutate(
+      Class   = clean_nm(.data[["Class"]]),
+      Order   = clean_nm(.data[["Order"]]),
+      Family  = clean_nm(.data[["Family"]]),
+      Species = clean_nm(.data[["Species"]])
+    )
+}
+
+# =============================================================================
+# 3) Diet helpers (used for Diet + diet_combo)
+# =============================================================================
+
+diet_aggregates <- function(df,
+                            inv_col    = "Diet-Inv",
+                            plant_cols = c("Diet-Fruit", "Diet-Nect", "Diet-Seed", "Diet-PlantO"),
+                            vert_cols  = c("Diet-Vend", "Diet-Vect", "Diet-Vfish", "Diet-Vunk", "Diet-Scav")) {
+
+  inv   <- if (inv_col %in% names(df)) numify(df[[inv_col]]) else rep(NA_real_, nrow(df))
+  fruit <- if ("Diet-Fruit"  %in% names(df)) numify(df[["Diet-Fruit"]])  else rep(NA_real_, nrow(df))
+  nect  <- if ("Diet-Nect"   %in% names(df)) numify(df[["Diet-Nect"]])   else rep(NA_real_, nrow(df))
+  seed  <- if ("Diet-Seed"   %in% names(df)) numify(df[["Diet-Seed"]])   else rep(NA_real_, nrow(df))
+  plant <- if ("Diet-PlantO" %in% names(df)) numify(df[["Diet-PlantO"]]) else rep(NA_real_, nrow(df))
+
+  vmat <- df[, intersect(vert_cols, names(df)), drop = FALSE]
+  vert <- if (ncol(vmat)) {
+    rowSums(dplyr::mutate(vmat, dplyr::across(dplyr::everything(), numify)), na.rm = TRUE)
+  } else {
+    rep(NA_real_, nrow(df))
+  }
+
+  frui_nect  <- fruit + nect
+  plant_seed <- seed + plant
+  all_plants <- frui_nect + plant_seed
+  all_animal <- vert + dplyr::coalesce(inv, 0)
+
+  tibble::tibble(
+    Diet_Inv          = inv,
+    Diet_VertFishScav = vert,
+    Diet_FruiNect     = frui_nect,
+    Diet_PlantSeed    = plant_seed,
+    Diet_AllPlants    = all_plants,
+    Diet_AllAnimal    = all_animal
+  )
+}
+
+# Legacy bird diet triple string: "<Inv>_<AllPlants>_<VertFishScav>" (rounded ints)
+make_diet_combo_triple <- function(inv, all_plants, vert, digits = 0) {
+  inv        <- suppressWarnings(as.numeric(inv))
+  all_plants <- suppressWarnings(as.numeric(all_plants))
+  vert       <- suppressWarnings(as.numeric(vert))
+
+  ok  <- is.finite(inv) & is.finite(all_plants) & is.finite(vert)
+  out <- rep(NA_character_, length(inv))
+  if (!any(ok)) return(out)
+
+  out[ok] <- sprintf(
+    "%d_%d_%d",
+    round(inv[ok], digits),
+    round(all_plants[ok], digits),
+    round(vert[ok], digits)
+  )
+  out
+}
+
+# Mammal trophic class for density model (>=80% dominance rule)
+classify_mammal_trophic <- function(all_animal, all_plants, mass_g) {
+  dplyr::case_when(
+    !is.finite(mass_g) ~ NA_character_,
+    all_animal >= 80   ~ "carnivore",
+    all_plants >= 80   ~ "herbivore",
+    TRUE               ~ "omnivore"
+  )
+}
+
+# Bird Diet.5Cat: prefer an existing column; otherwise infer from Diet-* components
+get_bird_diet5cat <- function(df,
+                              prefer_cols = c("Diet.5Cat", "Diet-5Cat", "Diet_5Cat",
+                                              "diet.5cat", "diet_5cat", "diet-5cat")) {
+  hit <- intersect(prefer_cols, names(df))
+  if (length(hit)) {
+    out <- stringr::str_squish(as.character(df[[hit[[1]]]]))
+    out[out == ""] <- NA_character_
+    return(out)
+  }
+
+  agg <- diet_aggregates(df)
+  inv    <- agg$Diet_Inv
+  vert   <- agg$Diet_VertFishScav
+  frui   <- agg$Diet_FruiNect
+  pseed  <- agg$Diet_PlantSeed
+  plants <- agg$Diet_AllPlants
+
+  out <- rep(NA_character_, nrow(df))
+  dom <- pmax(inv, vert, plants, na.rm = TRUE)
+
+  out[is.finite(dom) & dom >= 50 & dom == vert]  <- "VertFishScav"
+  out[is.finite(dom) & dom >= 50 & dom == inv]   <- "Invertebrate"
+  out[is.finite(dom) & dom >= 50 & dom == plants & frui  >= pseed] <- "FruiNect"
+  out[is.finite(dom) & dom >= 50 & dom == plants & pseed >  frui]  <- "PlantSeed"
+  out[is.na(out) & (is.finite(inv) | is.finite(vert) | is.finite(plants))] <- "Omnivore"
+
+  out
+}
+
+# =============================================================================
+# 4) Random effects attachment
+# =============================================================================
+
+# Attach Order/Family/Species random effects to dat.
+# Expected columns on dat: taxon_class, orderName, familyName, original_scientificName
+attach_random_effects <- function(dat, re_tbl) {
+  dat |>
+    dplyr::mutate(
+      class_clean   = clean_nm(.data[["taxon_class"]]),
+      order_clean   = clean_nm(.data[["orderName"]]),
+      family_clean  = clean_nm(.data[["familyName"]]),
+      species_clean = clean_nm(.data[["original_scientificName"]])
+    ) |>
+    dplyr::left_join(
+      re_tbl |>
+        dplyr::select(Class, Order, Effect_Order) |>
+        dplyr::distinct(),
+      by = c("class_clean" = "Class", "order_clean" = "Order")
+    ) |>
+    dplyr::left_join(
+      re_tbl |>
+        dplyr::select(Class, Family, Effect_Family) |>
+        dplyr::distinct(),
+      by = c("class_clean" = "Class", "family_clean" = "Family")
+    ) |>
+    dplyr::left_join(
+      re_tbl |>
+        dplyr::select(Class, Species, Effect_Species) |>
+        dplyr::distinct(),
+      by = c("class_clean" = "Class", "species_clean" = "Species")
+    ) |>
+    dplyr::mutate(
+      Effect_Order   = dplyr::coalesce(.data[["Effect_Order"]],   0),
+      Effect_Family  = dplyr::coalesce(.data[["Effect_Family"]],  0),
+      Effect_Species = dplyr::coalesce(.data[["Effect_Species"]], 0)
+    ) |>
+    dplyr::select(-class_clean, -order_clean, -family_clean, -species_clean)
+}
+
+# =============================================================================
+# 5) IUCN habitat helper (required, fail-fast, no caching)
+# =============================================================================
+
+# IUCN Habitat Classification Scheme (Level 1)
+.iucn_level1_lookup <- c(
+  `1`  = "Forest", `2`  = "Savanna", `3`  = "Shrubland", `4`  = "Grassland",
+  `5`  = "Wetlands (inland)", `6`  = "Rocky Areas", `7`  = "Caves & Subterranean (non-aquatic)",
+  `8`  = "Desert", `9`  = "Marine Neritic", `10` = "Marine Oceanic", `11` = "Marine Deep Ocean Floor",
+  `12` = "Marine Intertidal", `13` = "Marine Coastal/Supratidal", `14` = "Artificial - Terrestrial",
+  `15` = "Artificial - Aquatic", `16` = "Introduced Vegetation", `17` = "Other", `18` = "Unknown"
+)
+
+# Normalize habitat codes so 14_3 becomes 14.3 etc.
+normalize_hab_code <- function(x) gsub("_", ".", trimws(as.character(x)), fixed = TRUE)
+
+# Optional grouping for a few 14.* (keeps masks-friendly labels *in addition* to level-1 labels)
+summarize_artificial_terrestrial <- function(codes_norm) {
+  at <- codes_norm[stringr::str_detect(codes_norm, "^14(\\.|$)")]
+  if (!length(at)) return(character(0))
+
+  lvl2 <- suppressWarnings(as.integer(stringr::str_match(at, "^14\\.(\\d+)")[, 2]))
+  lvl2 <- unique(lvl2[!is.na(lvl2)])
+
+  out <- character(0)
+  if (any(lvl2 %in% c(1, 2))) out <- c(out, "Arable & Pastureland")
+  if (any(lvl2 %in% c(3, 6))) out <- c(out, "Plantations & Heavily Degraded Former Forest")
+  if (any(lvl2 %in% c(4, 5))) out <- c(out, "Urban & Rural Gardens")
+  unique(out)
+}
+
+# Query IUCN once for (genus, species):
+# - error -> stop() immediately (fail-fast)
+# - success but zero "suitable" -> return NA columns (row kept)
+# Returns: habitat_codes_suitable, habitats_level1, habitats_mixed
+get_iucn_habitats_or_stop <- function(genus, species) {
+  res <- tryCatch(
+    rredlist::rl_species_latest(
+      genus   = trimws(genus),
+      species = trimws(species),
+      scope   = "1",
+      parse   = TRUE
+    ),
+    error = function(e) {
+      stop(
+        "IUCN API call failed for ", trimws(genus), " ", trimws(species), ": ",
+        conditionMessage(e),
+        call. = FALSE
+      )
+    }
+  )
+
+  hab <- res$habitats
+  if (is.null(hab) || !nrow(hab)) {
+    return(tibble::tibble(
+      habitat_codes_suitable = NA_character_,
+      habitats_level1        = NA_character_,
+      habitats_mixed         = NA_character_
+    ))
+  }
+
+  hab <- hab |>
+    dplyr::mutate(suitability = tolower(trimws(as.character(.data[["suitability"]])))) |>
+    dplyr::filter(suitability == "suitable")
+
+  if (!nrow(hab)) {
+    return(tibble::tibble(
+      habitat_codes_suitable = NA_character_,
+      habitats_level1        = NA_character_,
+      habitats_mixed         = NA_character_
+    ))
+  }
+
+  # All suitable codes (no mask filtering)
+  codes <- unique(normalize_hab_code(hab$code))
+  codes <- codes[!is.na(codes) & nzchar(codes)]
+  codes <- sort(codes)
+
+  # Level-1 labels from leading integer code
+  lvl1 <- suppressWarnings(as.integer(stringr::str_extract(codes, "^\\d+")))
+  lvl1_names <- unname(.iucn_level1_lookup[as.character(lvl1)])
+  lvl1_names <- unique(lvl1_names[!is.na(lvl1_names)])
+
+  # Mixed labels: include *all* level-1 labels + some grouped 14.* sublabels
+  mixed <- unique(c(lvl1_names, summarize_artificial_terrestrial(codes)))
+
+  tibble::tibble(
+    habitat_codes_suitable = if (length(codes))      paste(codes, collapse = ", ")      else NA_character_,
+    habitats_level1        = if (length(lvl1_names)) paste(lvl1_names, collapse = ", ") else NA_character_,
+    habitats_mixed         = if (length(mixed))      paste(mixed, collapse = ", ")      else NA_character_
+  )
+}
+
+# =============================================================================
+# 6) Gompertz helpers
+# =============================================================================
+
+# Only needed when DO_GOMPERTZ_BIRDS is TRUE (main pipeline calls it only then).
+std_combo_key <- function(x) {
+  x <- tolower(stringr::str_squish(as.character(x)))
+  x <- stringr::str_replace_all(x, "[/\\s\\-]+", "_")
+  x <- stringr::str_replace_all(x, "[^a-z0-9_]+", "_")
+  x <- stringr::str_replace_all(x, "_+", "_")
+  x <- stringr::str_replace_all(x, "^_|_$", "")
+  x
+}
+
+infer_bird_combo_from_diet <- function(df,
+                                      model_combo_levels,
+                                      threshold = 20,
+                                      min_score = 0.50) {
+  diet_cols <- grep("^Diet-", names(df), value = TRUE)
+  if (!length(diet_cols) || !length(model_combo_levels) || !nrow(df)) {
+    return(rep(NA_character_, nrow(df)))
+  }
+
+  diet_tokens <- tolower(stringr::str_replace(diet_cols, "^Diet-", ""))
+  diet_tokens <- stringr::str_replace_all(diet_tokens, "[^a-z0-9]+", "")
+  names(diet_tokens) <- diet_cols
+
+  model_tokens <- lapply(model_combo_levels, function(k) {
+    toks <- unlist(stringr::str_split(std_combo_key(k), "_"))
+    unique(toks[nzchar(toks)])
+  })
+  names(model_tokens) <- model_combo_levels
+
+  out <- rep(NA_character_, nrow(df))
+
+  for (i in seq_len(nrow(df))) {
+    v <- suppressWarnings(as.numeric(as.matrix(df[i, diet_cols, drop = FALSE])))
+    active <- diet_cols[is.finite(v) & v >= threshold]
+    if (!length(active)) next
+
+    toks_row <- unique(diet_tokens[active])
+    toks_row <- toks_row[!is.na(toks_row) & nzchar(toks_row)]
+    if (!length(toks_row)) next
+
+    best_k <- NA_character_
+    best_s <- -Inf
+
+    for (k in model_combo_levels) {
+      tk <- model_tokens[[k]]
+      inter <- length(intersect(toks_row, tk))
+      uni   <- length(unique(c(toks_row, tk)))
+      s <- if (uni > 0) inter / uni else 0
+      if (is.finite(s) && s > best_s) {
+        best_s <- s
+        best_k <- k
+      }
+    }
+
+    if (is.finite(best_s) && best_s >= min_score) out[i] <- best_k
+  }
+
+  out
+}
+
+# Predict positive Gompertz parameters from LOESS fits:
+# assumes model uses log10(mass_g) as the predictor.
+pred_loess_pos <- function(loess_fit, mass_g, clamp = TRUE) {
+  mg  <- suppressWarnings(as.numeric(mass_g))
+  out <- rep(NA_real_, length(mg))
+  ok  <- is.finite(mg) & mg > 0
+  if (!any(ok)) return(out)
+
+  logM <- log10(mg[ok])
+
+  if (isTRUE(clamp)) {
+    x <- loess_fit$x
+    if (is.matrix(x) || is.data.frame(x)) x <- x[, 1]
+    x <- suppressWarnings(as.numeric(x))
+    rng <- range(x, finite = TRUE)
+    if (all(is.finite(rng))) logM <- pmin(pmax(logM, rng[1]), rng[2])
+  }
+
+  pr <- suppressWarnings(stats::predict(loess_fit, newdata = data.frame(logM = logM)))
+  out[ok] <- exp(as.numeric(pr))
+  out
+}
+```
+
+```{r}
+## ---- main_pipeline_filter_traits_covariates_gompertz_write -------------------
+## Main pipeline (NO checks here; validation happens only in chunk 1):
+##   1) Read summary + synonyms + raster stems + traits
+##   2) Resolve ONE raster + ONE trait per row (original preferred, then synonym)
+##   3) Join traits
+##   4) Compute covariates (density/home-range/etc)
+##   5) Add Gompertz columns (always present; fill depends on flags)
+##   6) Query IUCN suitable habitats (always; fail-fast; no caching)
+##   7) Select minimal output columns (core + audit)
+##   8) Write Data/Clean/species_table.csv
+
+# ------------------------------------------------------------------------------
+# 1) Load core inputs
+# ------------------------------------------------------------------------------
+summary_df <- readr::read_csv(paths$summary_csv, show_col_types = FALSE) |>
+  dplyr::mutate(
+    row_id = dplyr::row_number(),
+    scientificName = stringr::str_squish(as.character(scientificName)),
+    # Stable class label used throughout this pipeline
+    taxon_class = dplyr::case_when(
+      stringr::str_to_lower(stringr::str_squish(as.character(className))) == "mammalia" ~ "Mammalia",
+      stringr::str_to_lower(stringr::str_squish(as.character(className))) == "aves"     ~ "Aves",
+      TRUE ~ NA_character_
+    )
+  )
+
+syn_map <- read_synonyms(paths$synonyms)
+
+raster_mam <- list_raster_stems(paths$mammal_dir)
+raster_brd <- list_raster_stems(paths$bird_dir)
+
+traits_all <- dplyr::bind_rows(
+  read_traits(paths$mammal_raw, "Mammalia"),
+  read_traits(paths$bird_raw,   "Aves")
+)
+
+# Fast lookup keys for trait existence (class-aware)
+trait_key_index <- unique(paste(traits_all$taxon_class, traits_all$trait_clean, sep = "||"))
+
+# Only load Gompertz models if we will actually fill values
+models <- NULL
+if (isTRUE(DO_GOMPERTZ_MAMMALS) || isTRUE(DO_GOMPERTZ_BIRDS)) {
+  models <- readRDS(paths$loess_rds)
+}
+
+# ------------------------------------------------------------------------------
+# 2) Resolve ONE raster + ONE trait per row (original preferred, then synonym)
+# ------------------------------------------------------------------------------
+cands <- dplyr::bind_rows(
+  # Candidate = original scientificName
+  summary_df |>
+    dplyr::transmute(row_id, taxon_class, candidate = scientificName, kind = "original"),
+
+  # Candidate = synonym genus+species (via synonyms.csv)
+  summary_df |>
+    dplyr::select(row_id, taxon_class, scientificName) |>
+    dplyr::left_join(syn_map, by = c("scientificName" = "orig")) |>
+    dplyr::transmute(row_id, taxon_class, candidate = syn, kind = "synonym")
+) |>
+  dplyr::filter(!is.na(candidate), nzchar(candidate), !is.na(taxon_class)) |>
+  dplyr::mutate(
+    # Raster check is class-aware (mammals use mammal_dir, birds use bird_dir)
+    stem = to_stem(candidate),
+    raster_ok =
+      (taxon_class == "Mammalia" & stem %in% raster_mam) |
+      (taxon_class == "Aves"     & stem %in% raster_brd),
+
+    # Trait check is class-aware
+    trait_clean = clean_nm(candidate),
+    trait_ok = paste(taxon_class, trait_clean, sep = "||") %in% trait_key_index,
+
+    # Original names win ties
+    prio = dplyr::if_else(kind == "original", 0L, 1L)
+  )
+
+pick_first <- function(df, ok_col, out_name, out_tag) {
+  df |>
+    dplyr::filter(.data[[ok_col]]) |>
+    dplyr::group_by(row_id) |>
+    dplyr::arrange(prio) |>
+    dplyr::slice(1) |>
+    dplyr::ungroup() |>
+    dplyr::transmute(
+      row_id,
+      !!out_name := candidate,
+      !!out_tag  := kind
+    )
+}
+
+raster_pick <- pick_first(cands, "raster_ok", "name_raster", "match_raster")
+trait_pick  <- pick_first(cands, "trait_ok",  "name_trait",  "match_trait")
+
+dat <- summary_df |>
+  dplyr::left_join(raster_pick, by = "row_id") |>
+  dplyr::left_join(trait_pick,  by = "row_id") |>
+  # Keep only rows that match BOTH raster + trait
+  dplyr::filter(!is.na(name_raster), !is.na(name_trait)) |>
+  dplyr::mutate(
+    raster_stem = to_stem(name_raster),
+    trait_clean = clean_nm(name_trait)
+  ) |>
+  dplyr::select(-row_id)
+
+# ------------------------------------------------------------------------------
+# 3) Join traits (class-aware join key)
+# ------------------------------------------------------------------------------
+dat <- dat |>
+  dplyr::left_join(
+    traits_all,
+    by = c("taxon_class" = "taxon_class", "trait_clean" = "trait_clean")
+  ) |>
+  dplyr::select(-trait_clean)
+
+# ------------------------------------------------------------------------------
+# 4) Compute covariates (density, home range, dispersal, patch sizes)
+# ------------------------------------------------------------------------------
+re_all <- read_random_effects(paths$random_effects)
+
+# Random effects expect `original_scientificName` as the species key
+dat <- dat |>
+  dplyr::mutate(original_scientificName = scientificName) |>
+  attach_random_effects(re_all) |>
+  dplyr::select(-original_scientificName)
+
+# Diet aggregates (works for both taxa; uses Diet-* columns when present)
+agg <- diet_aggregates(dat)
+
+# Legacy bird diet triple for audit
+dat <- dat |>
+  dplyr::mutate(
+    diet_combo = dplyr::if_else(
+      taxon_class == "Aves",
+      make_diet_combo_triple(
+        inv        = agg$Diet_Inv,
+        all_plants = agg$Diet_AllPlants,
+        vert       = agg$Diet_VertFishScav,
+        digits     = 0
+      ),
+      NA_character_
+    )
+  )
+
+# Diet label stored in ONE column for both taxa:
+# - Mammals: herbivore/omnivore/carnivore (>=80% rule)
+# - Birds  : Diet.5Cat (use existing column if present; else infer from Diet-* components)
+bird_diet5 <- get_bird_diet5cat(dat)
+
+dat <- dat |>
+  dplyr::mutate(
+    Diet = dplyr::case_when(
+      taxon_class == "Mammalia" ~ classify_mammal_trophic(
+        all_animal = agg$Diet_AllAnimal,
+        all_plants = agg$Diet_AllPlants,
+        mass_g     = BodyMass.Value
+      ),
+      taxon_class == "Aves" ~ bird_diet5,
+      TRUE ~ NA_character_
+    )
+  )
+
+# Density + home range parameterization (constants inline for transparency)
+MAM_B0     <-  2.4814753048
+MAM_B_MASS <- -0.3296510182
+MAM_B_HERB <- -0.1003301887
+MAM_B_OMNI <- -0.0552981064
+MAM_B_CARN <-  0.0
+
+BRD_B0     <-  1.30947404816817
+BRD_B_MASS <- -0.341277579477041
+BRD_FE <- c(
+  FruiNect     = 0.42760614375972505,
+  Invertebrate = 0.181241393478166,
+  Omnivore     = 0.28471583669890205,
+  PlantSeed    = 0.34312864063468,
+  VertFishScav = 0
+)
+
+mass_ok <- is.finite(dat$BodyMass.Value) & dat$BodyMass.Value > 0
+mass_kg <- dat$BodyMass.Value / 1000
+
+# Mammals
+ii_mam <- dat$taxon_class == "Mammalia" & mass_ok
+diet_eff_mam <- dplyr::case_when(
+  dat$Diet == "herbivore" ~ MAM_B_HERB,
+  dat$Diet == "omnivore"  ~ MAM_B_OMNI,
+  dat$Diet == "carnivore" ~ MAM_B_CARN,
+  TRUE ~ 0
+)
+
+log10_density_mam <- rep(NA_real_, nrow(dat))
+log10_density_mam[ii_mam] <-
+  MAM_B0 +
+  dat$Effect_Order[ii_mam] + dat$Effect_Family[ii_mam] + dat$Effect_Species[ii_mam] +
+  diet_eff_mam[ii_mam] + MAM_B_MASS * log10(dat$BodyMass.Value[ii_mam])
+
+density_mam <- 10^log10_density_mam
+
+home_range_mam <- rep(NA_real_, nrow(dat))
+home_range_mam[ii_mam] <- dplyr::case_when(
+  !is.finite(mass_kg[ii_mam]) | mass_kg[ii_mam] <= 0 ~ NA_real_,
+  dat$Diet[ii_mam] == "carnivore" ~ 0.38  * mass_kg[ii_mam]^1.13,
+  TRUE                            ~ 0.054 * mass_kg[ii_mam]
+)
+
+# Birds
+ii_brd <- dat$taxon_class == "Aves" & mass_ok
+diet_eff_brd <- rep(NA_real_, nrow(dat))
+diet_eff_brd[ii_brd] <- unname(BRD_FE[dat$Diet[ii_brd]])
+
+log10_density_brd <- rep(NA_real_, nrow(dat))
+ok_brd <- ii_brd & is.finite(diet_eff_brd)
+log10_density_brd[ok_brd] <-
+  BRD_B0 +
+  dat$Effect_Order[ok_brd] + dat$Effect_Family[ok_brd] + dat$Effect_Species[ok_brd] +
+  diet_eff_brd[ok_brd] + BRD_B_MASS * log10(dat$BodyMass.Value[ok_brd])
+
+density_brd <- 10^log10_density_brd
+
+home_range_brd <- rep(NA_real_, nrow(dat))
+home_range_brd[ii_brd] <- dplyr::case_when(
+  !is.finite(mass_kg[ii_brd]) | mass_kg[ii_brd] <= 0 ~ NA_real_,
+  dat$Diet[ii_brd] == "VertFishScav" ~ 21  * mass_kg[ii_brd]^1.13,
+  TRUE                               ~ 3.7 * mass_kg[ii_brd]
+)
+
+# Unify into shared covariate columns
+dat <- dat |>
+  dplyr::mutate(
+    density = dplyr::case_when(
+      taxon_class == "Mammalia" ~ density_mam,
+      taxon_class == "Aves"     ~ density_brd,
+      TRUE ~ NA_real_
+    ),
+    home_range_size = dplyr::case_when(
+      taxon_class == "Mammalia" ~ home_range_mam,
+      taxon_class == "Aves"     ~ home_range_brd,
+      TRUE ~ NA_real_
+    ),
+    dispersal_dist = dplyr::case_when(
+      taxon_class == "Mammalia" ~ 5.6  * sqrt(home_range_mam),
+      taxon_class == "Aves"     ~ 12.0 * sqrt(home_range_brd),
+      TRUE ~ NA_real_
+    ),
+    min_patch_size = 10  / density,
+    min_pop_size   = 500 / density
+  )
+
+# ------------------------------------------------------------------------------
+# 5) Gompertz (always create columns; fill depends on flags)
+# ------------------------------------------------------------------------------
+# Always-present columns (all NA unless filled)
+for (cc in CURVES) {
+  dat[[paste0("alpha_", cc)]] <- NA_real_
+  dat[[paste0("beta_",  cc)]] <- NA_real_
+}
+
+idx_mass <- is.finite(dat$BodyMass.Value) & dat$BodyMass.Value > 0
+
+# Mammals: global LOESS (per curve)
+if (isTRUE(DO_GOMPERTZ_MAMMALS) && !is.null(models)) {
+  ii <- idx_mass & dat$taxon_class == "Mammalia"
+  if (any(ii)) {
+    for (cc in CURVES) {
+      dat[[paste0("alpha_", cc)]][ii] <- pred_loess_pos(models$mammals[[cc]]$alpha, dat$BodyMass.Value[ii])
+      dat[[paste0("beta_",  cc)]][ii] <- pred_loess_pos(models$mammals[[cc]]$beta,  dat$BodyMass.Value[ii])
+    }
+  }
+}
+
+# Birds: combo-specific LOESS (per curve; combo inferred from Diet-* columns)
+if (isTRUE(DO_GOMPERTZ_BIRDS) && !is.null(models)) {
+  ii_bird <- dat$taxon_class == "Aves"
+  model_keys <- names(models$birds)
+
+  combo_key <- rep(NA_character_, nrow(dat))
+  if (any(ii_bird) && length(model_keys)) {
+    combo_key[ii_bird] <- infer_bird_combo_from_diet(
+      df = dat[ii_bird, , drop = FALSE],
+      model_combo_levels = model_keys
+    )
+  }
+
+  ii <- idx_mass & ii_bird & !is.na(combo_key) & combo_key %in% model_keys
+  if (any(ii)) {
+    by_combo <- split(which(ii), combo_key[ii])
+    for (cb in names(by_combo)) {
+      jj <- by_combo[[cb]]
+      for (cc in CURVES) {
+        dat[[paste0("alpha_", cc)]][jj] <- pred_loess_pos(models$birds[[cb]][[cc]]$alpha, dat$BodyMass.Value[jj])
+        dat[[paste0("beta_",  cc)]][jj] <- pred_loess_pos(models$birds[[cb]][[cc]]$beta,  dat$BodyMass.Value[jj])
+      }
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 6) IUCN suitable habitats (ALWAYS; fail-fast; no caching)
+# ------------------------------------------------------------------------------
+species_tbl <- dat |>
+  dplyr::distinct(genusName, speciesName) |>
+  dplyr::filter(!is.na(genusName), nzchar(genusName), !is.na(speciesName), nzchar(speciesName))
+
+hab_map <- dplyr::bind_rows(Map(
+  f = function(g, s) {
+    out <- get_iucn_habitats_or_stop(g, s)
+    Sys.sleep(2)  # <-- throttle: wait 2 seconds between API calls
+    out |>
+      dplyr::mutate(genusName = g, speciesName = s)
+  },
+  species_tbl$genusName,
+  species_tbl$speciesName
+))
+
+dat <- dat |>
+  dplyr::left_join(hab_map, by = c("genusName", "speciesName"))
+
+# ------------------------------------------------------------------------------
+# 7) Minimal output columns (core + audit)
+# ------------------------------------------------------------------------------
+keep_cols <- c(
+  # Core identifiers + audit traceability
+  "scientificName", "className", "orderName", "familyName", "genusName", "speciesName",
+  "redlistCategory",
+  "raster_stem", "name_raster", "match_raster",
+  "name_trait",  "match_trait",
+
+  # Core covariates used downstream
+  "BodyMass.Value", "Diet", "diet_combo",
+  "density", "home_range_size", "dispersal_dist", "min_patch_size", "min_pop_size",
+
+  # Gompertz (always present)
+  as.vector(rbind(paste0("alpha_", CURVES), paste0("beta_", CURVES))),
+
+  # IUCN habitat summaries
+  "habitat_codes_suitable", "habitats_level1", "habitats_mixed"
+)
+
+dat_out <- dat |>
+  dplyr::select(dplyr::any_of(keep_cols))
+
+# ------------------------------------------------------------------------------
+# 8) Write the ONE canonical output
+# ------------------------------------------------------------------------------
+readr::write_csv(dat_out, paths$out_csv)
+message("Wrote: ", paths$out_csv, " (n=", nrow(dat_out), ")")
+```

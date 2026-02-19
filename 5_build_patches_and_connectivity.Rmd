@@ -1,0 +1,867 @@
+
+
+---
+title: "5_build_patches_and_connectivity"
+output: html_document
+---
+
+```{r}
+## ---- sanity_precondition_validation_checks ---------------------------------
+## The ONLY place in this Rmd where we validate.
+## Everything below assumes these checks passed.
+##
+## Goal: minimal, fail-fast validation for the patch/connectivity pipeline.
+## Outputs created by this script (and only these):
+##   - Data/Clean/Patches/<species>.tif
+##   - Data/Clean/all_patch_lookup.rds
+##   - Data/Clean/all_connectivity.rds
+##
+## NOTE: Habitat masks are rebuilt *in memory* every run (no masks.tif saved).
+
+# =============================================================================
+# 0) Tiny assertion helpers
+# =============================================================================
+assert <- function(ok, msg) if (!isTRUE(ok)) stop(msg, call. = FALSE)
+
+need_file <- function(path, label = path) {
+  assert(file.exists(path), paste0("Missing file: ", label, "\nPath: ", path))
+}
+need_dir <- function(path, label = path) {
+  assert(dir.exists(path), paste0("Missing directory: ", label, "\nPath: ", path))
+}
+
+# =============================================================================
+# 1) User switches (taxon gating)
+# =============================================================================
+DO_MAMMALS <- TRUE
+DO_BIRDS   <- TRUE
+
+assert(is.logical(DO_MAMMALS) && length(DO_MAMMALS) == 1, "DO_MAMMALS must be TRUE/FALSE.")
+assert(is.logical(DO_BIRDS)   && length(DO_BIRDS)   == 1, "DO_BIRDS must be TRUE/FALSE.")
+assert(DO_MAMMALS || DO_BIRDS, "Both DO_MAMMALS=FALSE and DO_BIRDS=FALSE -> nothing to do in this script.")
+
+# =============================================================================
+# 2) Packages
+# =============================================================================
+pkgs <- c("terra", "sf", "igraph", "dplyr", "fasterRaster", "readr", "stringr", "tools")
+miss <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+assert(length(miss) == 0, paste0("Missing package(s): ", paste(miss, collapse = ", ")))
+
+suppressPackageStartupMessages({
+  library(terra)
+  library(sf)
+  library(igraph)
+  library(dplyr)
+  library(fasterRaster)
+  library(readr)
+  library(stringr)
+  library(tools)
+})
+
+# S2 ON (needed for st_is_within_distance on lon/lat)
+sf::sf_use_s2(TRUE)
+
+# =============================================================================
+# 3) Paths (centralized)
+# =============================================================================
+paths <- list(
+  # Canonical species table produced by Untitled4
+  species_csv   = "Data/Clean/species_table.csv",
+
+  # Landcover source (always)
+  landcover_tif = "Data/Raw/esacci_2022_pfts.tif",
+
+  # Required outputs (and only outputs)
+  patch_dir     = "Data/Clean/Patches",
+  patch_lookup  = "Data/Clean/all_patch_lookup.rds",
+  connectivity  = "Data/Clean/all_connectivity.rds",
+
+  # Presence rasters live in working directory
+  mammal_dir    = "mammal_ppm_bin",
+  bird_dir      = "bird_ppm_bin"
+)
+
+# ROI (pipeline standard)
+roi <- terra::ext(43.18, 50.56, -25.64, -11.89)
+assert(inherits(roi, "SpatExtent"), "roi must be a terra::ext() / SpatExtent object.")
+
+# GRASS installation (required for fasterRaster clump)
+grassDir <- "C:/Program Files/GRASS GIS 8.4"
+
+# =============================================================================
+# 4) Minimal IO setup (directories)
+# =============================================================================
+if (!dir.exists("Data/Clean")) dir.create("Data/Clean", recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(paths$patch_dir)) dir.create(paths$patch_dir, recursive = TRUE, showWarnings = FALSE)
+need_dir("Data/Clean", "Data/Clean (output directory)")
+need_dir(paths$patch_dir, "Data/Clean/Patches (patch raster output directory)")
+
+# =============================================================================
+# 5) File existence checks
+# =============================================================================
+need_file(paths$species_csv,   "Data/Clean/species_table.csv")
+need_file(paths$landcover_tif, "Data/Raw/esacci_2022_pfts.tif")
+
+if (DO_MAMMALS) need_dir(paths$mammal_dir, "mammal_ppm_bin (presence rasters)")
+if (DO_BIRDS)   need_dir(paths$bird_dir,   "bird_ppm_bin (presence rasters)")
+
+# =============================================================================
+# 6) Species-table schema + content checks (fail-fast)
+# =============================================================================
+need_cols <- c(
+  "scientificName",
+  "className",
+  "habitats_mixed",
+  "raster_stem",
+  "min_patch_size",
+  "min_pop_size",
+  "dispersal_dist"
+)
+
+hdr <- readr::read_csv(paths$species_csv, show_col_types = FALSE, n_max = 0)
+missing_cols <- setdiff(need_cols, names(hdr))
+assert(length(missing_cols) == 0,
+       paste0("species_table.csv is missing required column(s): ", paste(missing_cols, collapse = ", ")))
+
+# Read only what we need for validation + gating
+sp <- readr::read_csv(
+  paths$species_csv,
+  show_col_types = FALSE,
+  progress = FALSE,
+  col_select = dplyr::all_of(need_cols)
+) |>
+  dplyr::mutate(
+    scientificName = stringr::str_squish(as.character(scientificName)),
+    class_lc       = stringr::str_to_lower(stringr::str_squish(as.character(className))),
+    habitats_mixed = stringr::str_squish(as.character(habitats_mixed)),
+    raster_stem    = stringr::str_to_lower(stringr::str_squish(as.character(raster_stem))),
+    min_patch_km2  = suppressWarnings(readr::parse_number(as.character(min_patch_size))),
+    min_pop_km2    = suppressWarnings(readr::parse_number(as.character(min_pop_size))),
+    disp_km        = suppressWarnings(readr::parse_number(as.character(dispersal_dist)))
+  )
+
+is_mam <- sp$class_lc == "mammalia"
+is_brd <- sp$class_lc == "aves"
+
+selected <- (DO_MAMMALS & is_mam) | (DO_BIRDS & is_brd)
+assert(any(selected, na.rm = TRUE),
+       paste0("After applying DO_MAMMALS/DO_BIRDS gating, there are zero rows to process.\n",
+              "DO_MAMMALS=", DO_MAMMALS, " DO_BIRDS=", DO_BIRDS))
+
+# Required non-missing values for selected rows (user stated these should always be present)
+assert(all(nzchar(sp$scientificName[selected])),
+       "species_table.csv has empty scientificName in row(s) selected for processing.")
+assert(all(nzchar(sp$habitats_mixed[selected])),
+       "species_table.csv has empty habitats_mixed in row(s) selected for processing.")
+assert(all(nzchar(sp$raster_stem[selected])),
+       "species_table.csv has empty raster_stem in row(s) selected for processing.")
+
+assert(all(is.finite(sp$min_patch_km2[selected]) & sp$min_patch_km2[selected] > 0),
+       "species_table.csv has non-positive / non-numeric min_patch_size in selected row(s).")
+assert(all(is.finite(sp$min_pop_km2[selected]) & sp$min_pop_km2[selected] > 0),
+       "species_table.csv has non-positive / non-numeric min_pop_size in selected row(s).")
+assert(all(is.finite(sp$disp_km[selected]) & sp$disp_km[selected] >= 0),
+       "species_table.csv has negative / non-numeric dispersal_dist in selected row(s).")
+
+# Patch filenames must be unique among species we will process (prevents silent overwrites)
+patch_filename_from_scientific <- function(sci) {
+  x <- stringr::str_squish(as.character(sci))
+  x <- stringr::str_replace_all(x, "\\s+", "_")
+  x <- stringr::str_replace_all(x, "[/\\\\:<>\"|?*]+", "_")
+  x <- stringr::str_replace_all(x, "[^A-Za-z0-9_]+", "_")
+  x <- stringr::str_replace_all(x, "_+", "_")
+  x <- stringr::str_replace_all(x, "^_|_$", "")
+  paste0(x, ".tif")
+}
+pf <- patch_filename_from_scientific(sp$scientificName[selected])
+dup <- unique(pf[duplicated(pf)])
+assert(length(dup) == 0,
+       paste0("Duplicate patch raster filenames after sanitizing scientificName.\n",
+              "This would overwrite patch rasters in ", paths$patch_dir, ".\n",
+              "Example duplicate(s): ", paste(head(dup, 10), collapse = ", ")))
+
+# =============================================================================
+# 7) Presence raster inventory (FAIL-FAST if a selected stem is missing)
+# =============================================================================
+list_bin_stems <- function(dir_path) {
+  ff <- list.files(dir_path, pattern = "_bin\\.tif$", full.names = FALSE, ignore.case = TRUE)
+  if (!length(ff)) return(character(0))
+  tools::file_path_sans_ext(ff) |> stringr::str_to_lower()
+}
+
+if (DO_MAMMALS) {
+  mam_stems <- list_bin_stems(paths$mammal_dir)
+  assert(length(mam_stems) > 0, paste0("No '*_bin.tif' rasters found in ", paths$mammal_dir))
+
+  want <- unique(sp$raster_stem[selected & is_mam])
+  want <- want[nzchar(want)]
+  miss <- setdiff(want, mam_stems)
+
+  # User requirement: missing presence rasters for selected species must STOP (fail-fast)
+  assert(length(miss) == 0,
+         paste0("Missing mammal presence raster(s) for selected species.\n",
+                "These raster_stem values have no matching *_bin.tif in ", paths$mammal_dir, ":\n",
+                paste(head(miss, 20), collapse = ", ")))
+}
+
+if (DO_BIRDS) {
+  brd_stems <- list_bin_stems(paths$bird_dir)
+  assert(length(brd_stems) > 0, paste0("No '*_bin.tif' rasters found in ", paths$bird_dir))
+
+  want <- unique(sp$raster_stem[selected & is_brd])
+  want <- want[nzchar(want)]
+  miss <- setdiff(want, brd_stems)
+
+  assert(length(miss) == 0,
+         paste0("Missing bird presence raster(s) for selected species.\n",
+                "These raster_stem values have no matching *_bin.tif in ", paths$bird_dir, ":\n",
+                paste(head(miss, 20), collapse = ", ")))
+}
+
+# =============================================================================
+# 8) fasterRaster + GRASS backend (required)
+# =============================================================================
+assert(dir.exists(grassDir), paste0("GRASS directory does not exist:\n", grassDir))
+# If GRASS/fasterRaster isn't configured properly, this should error and stop right here.
+fasterRaster::faster(grassDir = grassDir)
+
+# =============================================================================
+# 9) Success message
+# =============================================================================
+message(
+  "Validation OK | DO_MAMMALS=", DO_MAMMALS,
+  " DO_BIRDS=", DO_BIRDS,
+  " | species_csv=", paths$species_csv,
+  " | landcover=", paths$landcover_tif,
+  " | patches_out=", paths$patch_dir
+)
+```
+
+```{r}
+## ---- build_masks_roi --------------------------------------------------------
+## Build habitat masks from ESA CCI landcover, cropped to ROI.
+##
+## DESIGN:
+## - Compute-only chunk (no validation here; chunk 1 already did that).
+## - Masks are rebuilt EVERY run and kept in memory only (no masks.tif written).
+##
+## Objects created for downstream chunks:
+##   - masks             : SpatRaster (each layer is 1 / NA)
+##   - template          : masks[[1]] (grid used to align presence rasters)
+##   - valid_mask_layers : names(masks)
+
+# ------------------------------------------------------------------------------
+# 1) Landcover -> ROI (this defines the analysis grid for everything downstream)
+# ------------------------------------------------------------------------------
+lc     <- terra::rast(paths$landcover_tif)
+lc_roi <- terra::crop(lc, roi, snap = "out")
+rm(lc)
+
+# ------------------------------------------------------------------------------
+# 2) Habitat key -> ESA landcover codes (layers are named keys used downstream)
+# ------------------------------------------------------------------------------
+class_map <- list(
+  forest                      = c(50L, 60L, 61L, 62L, 70L, 71L, 72L, 90L, 160L),
+  savanna                     = c(120L, 121L, 122L),
+  shrubland                   = c(120L, 121L, 122L, 150L, 151L, 152L, 153L, 200L, 201L, 202L),
+  grassland                   = c(130L, 140L, 150L, 151L, 152L, 153L),
+  wetlands_inland             = c(20L, 80L, 81L, 82L, 160L, 170L, 180L, 210L),
+  rocky_areas                 = c(70L, 71L, 72L, 130L, 150L, 151L, 152L, 153L, 200L, 201L, 202L),
+  desert                      = c(150L, 151L, 152L, 153L, 200L, 201L, 202L),
+
+  # Artificial groupings used by habitats_mixed (IUCN 14.* grouped labels)
+  arable_pastureland          = c(11L, 20L, 190L),
+  plantations_degraded_forest = integer(0),  # kept for schema completeness (all-NA layer)
+  urban_rural_gardens         = c(190L),
+
+  # IUCN level-1 (15) may appear in habitats_mixed as "Artificial - Aquatic"
+  artificial_aquatic          = c(20L, 160L, 170L, 180L, 190L, 210L)
+)
+
+# Minimal extra layer requested: terrestrial artificial = union(arable + urban + plantations)
+class_map$artificial_terrestrial <- unique(c(
+  class_map$arable_pastureland,
+  class_map$urban_rural_gardens,
+  class_map$plantations_degraded_forest
+))
+
+# ------------------------------------------------------------------------------
+# 3) Build one 1/NA layer per habitat key
+# ------------------------------------------------------------------------------
+build_habitat_masks_from_lc <- function(lc_roi, class_map) {
+  base <- lc_roi[[1]]
+
+  terra::rast(lapply(names(class_map), function(nm) {
+    codes <- class_map[[nm]]
+
+    r <- if (length(codes) == 0L || all(is.na(codes))) {
+      base * NA_integer_
+    } else {
+      terra::ifel(base %in% codes, 1L, NA_integer_)
+    }
+
+    names(r) <- nm
+    r
+  }))
+}
+
+masks <- build_habitat_masks_from_lc(lc_roi, class_map)
+
+# ------------------------------------------------------------------------------
+# 4) Downstream convenience objects
+# ------------------------------------------------------------------------------
+template <- masks[[1]]
+valid_mask_layers <- names(masks)
+```
+
+```{r}
+## ---- main_unified_patches_connectivity -------------------------------------
+## Unified mammals + birds patch/connectivity builder.
+##
+## ASSUMES chunk 1 (validation) and chunk 2 (masks) have already run successfully.
+##
+## Writes ONLY the required outputs:
+##   - Data/Clean/Patches/<scientificName_sanitized>.tif   (one per species; overwrites)
+##   - Data/Clean/all_patch_lookup.rds
+##   - Data/Clean/all_connectivity.rds
+##
+## CSR schema (v2; legacy fields removed):
+##   Each connectivity entry is keyed by "<scientificName>|<pu_id>" and contains:
+##     - species   : scientific name
+##     - pu_id     : population unit id (1..k within species)
+##     - patch_ids : integer vector of FINAL patch IDs in CSR row order
+##     - row_ptr   : integer vector length (length(patch_ids) + 1), 0-based cumulative
+##     - col_idx   : integer vector of neighbor FINAL patch IDs (same id space as patch rasters)
+##
+## Interpretation:
+##   Row i corresponds to patch_ids[i].
+##   Its neighbors are col_idx[(row_ptr[i] + 1) : row_ptr[i+1]] (because row_ptr is 0-based).
+
+# ------------------------------------------------------------------------------
+# 0) Small compute helpers
+# ------------------------------------------------------------------------------
+
+log_step <- function(spp, msg) {
+  message(sprintf("[%s] [%s] %s",
+                  format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+                  spp, msg))
+}
+
+# Build a one-time index: names = raster stem (lowercase), values = full path.
+# Chunk 1 already validated that every selected stem exists, so missing here is a logic bug -> stop().
+make_presence_index <- function(dir_path) {
+  ff <- list.files(dir_path, pattern = "_bin\\.tif$", full.names = TRUE, ignore.case = TRUE)
+  stems <- tools::file_path_sans_ext(basename(ff)) |>
+    stringr::str_to_lower()
+  stats::setNames(ff, stems)
+}
+
+# Load presence raster, align it to the analysis grid (template), then coerce to 1/NA.
+load_presence_aligned01 <- function(pres_path, template) {
+  r <- terra::rast(pres_path)
+
+  # If geometry differs, project (if CRS differs) then resample to template grid.
+  if (!terra::compareGeom(r, template, stopOnError = FALSE)) {
+    if (!terra::same.crs(r, template)) {
+      r <- terra::project(r, template, method = "near")
+    }
+    r <- terra::resample(r, template, method = "near")
+  }
+
+  terra::ifel(r == 1L, 1L, NA_integer_)
+}
+
+# Union of multiple habitat mask layers: 1 if any layer is 1; else NA.
+habitat_union <- function(masks, mask_names) {
+  x <- masks[[mask_names]]
+  if (terra::nlyr(x) == 1) return(x)
+
+  terra::app(x, fun = function(v) {
+    # terra may pass a matrix (block) or a vector (single cell)
+    if (is.matrix(v)) {
+      ok <- rowSums(v == 1L, na.rm = TRUE) > 0
+      out <- rep.int(NA_integer_, nrow(v))
+      out[ok] <- 1L
+      out
+    } else {
+      if (any(v == 1L, na.rm = TRUE)) 1L else NA_integer_
+    }
+  })
+}
+
+# habitats_mixed: comma-separated labels -> character vector (trimmed, unique).
+parse_habitats_mixed <- function(x) {
+  out <- unlist(strsplit(as.character(x), ",", fixed = TRUE))
+  out <- stringr::str_squish(out)
+  out <- out[nzchar(out)]
+  unique(out)
+}
+
+# Build PU-wise CSR adjacency, keyed by "<scientificName>|<pu_id>"
+# FIX: CSR col_idx now stores PU-local COLUMN INDICES (0-based), not patch IDs.
+#      patch_ids remains the lookup vector: patch_id = patch_ids[col_idx + 1].
+build_pu_connectivity <- function(nb, patches_sf, patch_to_pop_kept, final_patch_ids, sci) {
+
+  # Build undirected edge list from nb (indices refer to row order in patches_sf)
+  ei <- integer()
+  ej <- integer()
+  for (ii in seq_along(nb)) {
+    nbrs <- as.integer(nb[[ii]])
+    nbrs <- nbrs[nbrs > ii] # keep upper triangle to avoid duplicates
+    if (length(nbrs)) {
+      ei <- c(ei, rep.int(ii, length(nbrs)))
+      ej <- c(ej, nbrs)
+    }
+  }
+
+  edges <- data.frame(
+    patch_i = patches_sf$patch_id[ei],  # pre-final IDs (after min_patch filter)
+    patch_j = patches_sf$patch_id[ej]
+  )
+
+  # Keep only edges among patches that survive the population filter (pre-final IDs)
+  keep_patch_ids <- as.integer(names(final_patch_ids))  # pre-final patch IDs that survived
+  edges <- edges[
+    edges$patch_i %in% keep_patch_ids & edges$patch_j %in% keep_patch_ids,
+    ,
+    drop = FALSE
+  ]
+
+  # Convert endpoints from pre-final patch IDs -> FINAL patch IDs (species-wide 1..N)
+  if (nrow(edges)) {
+    edges$patch_i <- as.integer(final_patch_ids[as.character(edges$patch_i)])
+    edges$patch_j <- as.integer(final_patch_ids[as.character(edges$patch_j)])
+    edges <- edges[stats::complete.cases(edges), , drop = FALSE]
+  }
+
+  out <- list()
+
+  for (pu in sort(unique(patch_to_pop_kept$pu_id_final))) {
+
+    # FINAL patch IDs in this PU (these define CSR row order)
+    patch_ids <- sort(unique(patch_to_pop_kept$patch_id_final[patch_to_pop_kept$pu_id_final == pu]))
+    patch_ids <- patch_ids[!is.na(patch_ids)]
+    if (!length(patch_ids)) next
+
+    # Map FINAL patch ID -> PU-local 1-based index (then convert to 0-based for col_idx)
+    idx_map <- seq_along(patch_ids)
+    names(idx_map) <- as.character(patch_ids)
+
+    # Subset to PU-only edges in FINAL ID space (species-wide IDs)
+    sub <- if (nrow(edges)) {
+      edges[
+        edges$patch_i %in% patch_ids & edges$patch_j %in% patch_ids,
+        ,
+        drop = FALSE
+      ]
+    } else {
+      edges
+    }
+
+    # Build CSR over PU-local indices:
+    # row i corresponds to patch_ids[i]; neighbors are PU-local indices in col_idx (0-based).
+    if (!nrow(sub)) {
+
+      lens    <- integer(length(patch_ids)) # all zeros
+      row_ptr <- as.integer(c(0L, cumsum(lens)))
+      col_idx <- integer(0)
+
+    } else {
+
+      # Make symmetric adjacency in FINAL ID space
+      E2 <- rbind(
+        data.frame(i = sub$patch_i, j = sub$patch_j),
+        data.frame(i = sub$patch_j, j = sub$patch_i)
+      )
+      E2 <- E2[E2$i != E2$j, , drop = FALSE]
+      E2 <- unique(E2)
+      E2 <- E2[order(E2$i, E2$j), , drop = FALSE]
+
+      # Convert (FINAL patch IDs) -> (PU-local indices, 0-based)
+      ii_loc <- idx_map[as.character(E2$i)]
+      jj_loc <- idx_map[as.character(E2$j)]
+      ok <- !is.na(ii_loc) & !is.na(jj_loc)
+      if (any(!ok)) {
+        ii_loc <- ii_loc[ok]
+        jj_loc <- jj_loc[ok]
+      }
+      ii_loc0 <- as.integer(ii_loc) - 1L
+      jj_loc0 <- as.integer(jj_loc) - 1L
+
+      # Split neighbors by PU-local row index (0-based stored, but split key will be 1-based here)
+      # We'll build adj_list in row order 1..n to compute row_ptr and col_idx.
+      split_idx <- split(jj_loc0, as.integer(ii_loc))  # names are "1","2",...
+
+      adj_list <- vector("list", length(patch_ids))
+      for (r in seq_along(patch_ids)) {
+        v <- split_idx[[as.character(r)]]
+        if (is.null(v)) {
+          adj_list[[r]] <- integer(0)
+        } else {
+          # optional: ensure sorted / unique neighbors (nice CSR invariant)
+          adj_list[[r]] <- as.integer(sort(unique(v)))
+        }
+      }
+
+      lens    <- vapply(adj_list, length, integer(1))
+      row_ptr <- as.integer(c(0L, cumsum(lens)))
+      col_idx <- as.integer(unlist(adj_list, use.names = FALSE))
+    }
+
+    key <- paste0(sci, "|", pu)
+    out[[key]] <- list(
+      species   = sci,
+      pu_id     = as.integer(pu),
+      patch_ids = as.integer(patch_ids),  # lookup vector for indices
+      row_ptr   = as.integer(row_ptr),    # 0-based
+      col_idx   = as.integer(col_idx)     # 0-based PU-local indices
+    )
+  }
+
+  out
+}
+
+# ------------------------------------------------------------------------------
+# 1) One-time indexes and species table (reuse the validated `sp` from chunk 1)
+# ------------------------------------------------------------------------------
+
+# Presence raster lookup tables (avoid listing files inside the species loop)
+presence_index_mam <- if (DO_MAMMALS) make_presence_index(paths$mammal_dir) else NULL
+presence_index_brd <- if (DO_BIRDS)   make_presence_index(paths$bird_dir)   else NULL
+
+# Species rows to process (already normalized in chunk 1 into `sp`)
+species_df <- sp |>
+  dplyr::filter((class_lc == "mammalia" & DO_MAMMALS) | (class_lc == "aves" & DO_BIRDS)) |>
+  dplyr::transmute(
+    scientificName,
+    class_lc,
+    habitats_mixed,
+    raster_stem,
+    min_patch_km2,
+    min_pop_km2,
+    disp_km
+  )
+
+# ------------------------------------------------------------------------------
+# 2) Habitat label -> mask layer mapping
+#    Unknown labels are ignored (dropped).
+# ------------------------------------------------------------------------------
+
+habitat_map <- c(
+  "Forest"                                       = "forest",
+  "Savanna"                                      = "savanna",
+  "Shrubland"                                    = "shrubland",
+  "Grassland"                                    = "grassland",
+  "Wetlands (inland)"                            = "wetlands_inland",
+  "Rocky Areas"                                  = "rocky_areas",
+  "Desert"                                       = "desert",
+  "Arable & Pastureland"                         = "arable_pastureland",
+  "Plantations & Heavily Degraded Former Forest" = "plantations_degraded_forest",
+  "Urban & Rural Gardens"                        = "urban_rural_gardens",
+  "Artificial - Aquatic"                         = "artificial_aquatic",
+  "Artificial - Terrestrial"                     = "artificial_terrestrial"
+)
+
+# ------------------------------------------------------------------------------
+# 3) Outputs (accumulators)
+# ------------------------------------------------------------------------------
+
+all_patch_lookup <- data.frame(
+  scientificName   = character(),
+  patch_id         = integer(),
+  pu_id            = integer(),
+  patch_area_km2   = numeric(),
+  stringsAsFactors = FALSE
+)
+
+all_connectivity <- list()
+
+# ------------------------------------------------------------------------------
+# 4) Main loop (compute only; all validation already happened in chunk 1)
+# ------------------------------------------------------------------------------
+
+for (i in seq_len(nrow(species_df))) {
+
+  sci <- species_df$scientificName[i]
+  log_step(sci, "START")
+
+  # ---- presence raster (fail-fast if missing; should not happen after chunk 1)
+  stem <- species_df$raster_stem[i]
+  pres_path <- if (species_df$class_lc[i] == "mammalia") {
+    presence_index_mam[[stem]]
+  } else {
+    presence_index_brd[[stem]]
+  }
+  if (is.null(pres_path) || is.na(pres_path)) {
+    stop("Presence raster missing for selected species: ", sci,
+         " | raster_stem=", stem, call. = FALSE)
+  }
+
+  # ---- habitat masks for this species (ignore unknown labels)
+  lbls <- parse_habitats_mixed(species_df$habitats_mixed[i])
+  mask_names <- unname(habitat_map[lbls])
+  mask_names <- unique(mask_names[!is.na(mask_names)])
+  mask_names <- mask_names[mask_names %in% valid_mask_layers]
+
+  # If no known habitat layers remain after dropping unknown labels -> skip species
+  if (!length(mask_names)) {
+    log_step(sci, "SKIP (no known habitat labels after mapping)")
+    next
+  }
+
+  min_patch_km2 <- species_df$min_patch_km2[i]
+  min_pop_km2   <- species_df$min_pop_km2[i]
+  disp_km       <- species_df$disp_km[i]
+
+  # =============================================================================
+  # 1) Suitability = (habitat union) ∩ presence  (binary 1/NA)
+  # =============================================================================
+  log_step(sci, "SUITABILITY")
+
+  hab    <- habitat_union(masks, mask_names)
+  pres01 <- load_presence_aligned01(pres_path, template)
+  suit   <- terra::ifel(hab == 1L & pres01 == 1L, 1L, NA_integer_)
+
+  # Trim edges to speed clumping; if empty -> skip
+  suit_trim <- tryCatch(terra::trim(suit), error = function(e) NULL)
+  if (is.null(suit_trim) || terra::ncell(suit_trim) == 0) {
+    log_step(sci, "SKIP (empty suitability)")
+    next
+  }
+
+  # =============================================================================
+  # 2) Patches: clump + area + min_patch_size filter
+  # =============================================================================
+  log_step(sci, "PATCHES")
+
+  cl_fast <- fasterRaster::clump(fasterRaster::fast(suit_trim), diagonal = FALSE)
+  cl_spat <- terra::rast(cl_fast)
+
+  cell_area_km <- terra::cellSize(suit_trim, unit = "km")
+  area_tab <- as.data.frame(terra::zonal(cell_area_km, cl_spat, "sum", na.rm = TRUE))
+  if (!nrow(area_tab)) {
+    log_step(sci, "SKIP (no patches after clumping)")
+    next
+  }
+  names(area_tab) <- c("old_id", "area_km2")
+  area_tab <- area_tab[!is.na(area_tab$old_id), , drop = FALSE]
+  if (!nrow(area_tab)) {
+    log_step(sci, "SKIP (all patch IDs NA)")
+    next
+  }
+
+  keep_old <- area_tab$old_id[area_tab$area_km2 >= min_patch_km2]
+  if (!length(keep_old)) {
+    log_step(sci, "SKIP (no patches >= min_patch_size)")
+    next
+  }
+
+  # Reindex kept patch IDs 1..n (trimmed extent), then extend back to full extent
+  kept_ids_trim <- terra::classify(
+    cl_spat,
+    rcl    = cbind(as.integer(keep_old), seq_along(keep_old)),
+    others = NA_integer_
+  )
+  kept_ids_full <- terra::extend(kept_ids_trim, suit)
+
+  patches_tab <- data.frame(
+    patch_id       = seq_along(keep_old),
+    patch_area_km2 = area_tab$area_km2[match(keep_old, area_tab$old_id)]
+  )
+
+  # =============================================================================
+  # 3) Population units (PUs) via dispersal distance
+  # =============================================================================
+  log_step(sci, "POPULATIONS")
+
+  patches_sf <- tryCatch(
+    sf::st_as_sf(terra::as.polygons(kept_ids_full, values = TRUE, dissolve = TRUE)),
+    error = function(e) NULL
+  )
+  if (is.null(patches_sf) || !nrow(patches_sf)) {
+    log_step(sci, "SKIP (polygonization failed / no polygons)")
+    next
+  }
+
+  val_col <- setdiff(names(patches_sf), attr(patches_sf, "sf_column"))[1]
+  patches_sf$patch_id <- as.integer(patches_sf[[val_col]])
+  patches_sf <- patches_sf[!is.na(patches_sf$patch_id), ]
+  if (!nrow(patches_sf)) {
+    log_step(sci, "SKIP (no valid patch polygons)")
+    next
+  }
+
+  nb <- sf::st_is_within_distance(patches_sf, patches_sf, dist = disp_km * 1000)
+
+  g <- igraph::graph_from_adj_list(nb, mode = "out") |>
+    igraph::as_undirected("collapse") |>
+    igraph::simplify(remove.multiple = TRUE, remove.loops = TRUE)
+
+  comp <- igraph::components(g)$membership
+  patches_sf$pu_id_unfiltered <- as.integer(match(comp, sort(unique(comp))))
+
+  patch_to_pop <- data.frame(
+    patch_id         = patches_sf$patch_id,
+    pu_id_unfiltered = patches_sf$pu_id_unfiltered
+  )
+
+  # =============================================================================
+  # 4) Population filter using min_pop_size (km² total area threshold)
+  #     If zero final PUs -> write nothing for this species (required behavior).
+  # =============================================================================
+  log_step(sci, "POP_FILTER")
+
+  patch_area_df <- merge(
+    patches_tab[, c("patch_id", "patch_area_km2")],
+    patch_to_pop,
+    by = "patch_id"
+  )
+
+  pop_area_df <- aggregate(patch_area_km2 ~ pu_id_unfiltered, patch_area_df, sum, na.rm = TRUE)
+  names(pop_area_df) <- c("pu_id_unfiltered", "pu_area_km2")
+
+  keep_pu <- sort(pop_area_df$pu_id_unfiltered[pop_area_df$pu_area_km2 >= min_pop_km2])
+  if (!length(keep_pu)) {
+    log_step(sci, "SKIP (no PUs >= min_pop_size; no raster written)")
+    next
+  }
+
+  patch_to_pop$pu_id_final <- match(patch_to_pop$pu_id_unfiltered, keep_pu)
+  patch_to_pop_kept <- patch_to_pop[!is.na(patch_to_pop$pu_id_final),
+                                    c("patch_id", "pu_id_final")]
+
+  # =============================================================================
+  # 5) Final patch IDs (reindex to 1..n) + record lookup
+  # =============================================================================
+  log_step(sci, "PATCH_REINDEX")
+
+  keep_patch_ids <- sort(unique(patch_to_pop_kept$patch_id))
+
+  patch_minpop_rast <- terra::classify(
+    kept_ids_full,
+    rcl    = cbind(as.integer(keep_patch_ids), seq_along(keep_patch_ids)),
+    others = NA_integer_
+  )
+
+  final_patch_ids <- seq_along(keep_patch_ids)             # FINAL IDs (1..n)
+  names(final_patch_ids) <- as.character(keep_patch_ids)   # map from pre-final patch_id -> FINAL id
+
+  # Add FINAL patch IDs to mapping table (used for CSR v2)
+  patch_to_pop_kept$patch_id_final <- as.integer(final_patch_ids[as.character(patch_to_pop_kept$patch_id)])
+
+  all_patch_lookup <- rbind(
+    all_patch_lookup,
+    data.frame(
+      scientificName = sci,
+      patch_id       = patch_to_pop_kept$patch_id_final,
+      pu_id          = patch_to_pop_kept$pu_id_final,
+      patch_area_km2 = patches_tab$patch_area_km2[
+        match(patch_to_pop_kept$patch_id, patches_tab$patch_id)
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+
+  # =============================================================================
+  # 6) Connectivity (CSR) within each PU (v2 schema; FINAL IDs)
+  # =============================================================================
+  log_step(sci, "CONNECTIVITY")
+  conn <- build_pu_connectivity(nb, patches_sf, patch_to_pop_kept, final_patch_ids, sci)
+  all_connectivity <- c(all_connectivity, conn)
+
+  # =============================================================================
+  # 7) Write patch raster (overwrite always)
+  # =============================================================================
+  log_step(sci, "WRITE_PATCH_RASTER")
+
+  out_file <- file.path(paths$patch_dir, patch_filename_from_scientific(sci))
+  terra::writeRaster(
+    patch_minpop_rast,
+    filename  = out_file,
+    overwrite = TRUE,
+    wopt = list(
+      datatype = "INT4U",
+      gdal     = c("TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+                   "COMPRESS=LZW", "BIGTIFF=IF_SAFER")
+    )
+  )
+
+  log_step(sci, "DONE")
+}
+
+# ------------------------------------------------------------------------------
+# 5) Save canonical outputs
+# ------------------------------------------------------------------------------
+
+# Stamp CSR schema version for downstream readers
+attr(all_connectivity, "csr_version") <- 2L
+attr(all_connectivity, "row_ptr_base") <- "0-based"
+attr(all_connectivity, "col_idx_space") <- "pu_local_index"
+attr(all_connectivity, "col_idx_base")  <- "0-based"
+
+log_step("ALL", "SAVE_OUTPUTS")
+saveRDS(all_patch_lookup, file = paths$patch_lookup)
+saveRDS(all_connectivity, file = paths$connectivity)
+```
+
+```{r}
+# Super simple: plot every patch raster in Data/Clean/Patches
+patch_files <- list.files("Data/Clean/Patches", pattern = "\\.tif$", full.names = TRUE)
+
+for (f in patch_files) {
+  r <- terra::rast(f)
+  plot(r, main = basename(f))
+}
+```
+
+```{r}
+## ---- patches_to_binary ------------------------------------------------------
+## Convert patch rasters (patch IDs / NA) -> binary rasters (1 / NA).
+##
+## Input:
+##   - Data/Clean/Patches/*.tif    (cells are NA or integer patch IDs)
+## Output (new, minimal additional output folder):
+##   - Data/Clean/Patches_binary/*.tif  (cells are NA or 1)
+
+bin_dir <- file.path("Data/Clean", "Patches_binary")
+dir.create(bin_dir, recursive = TRUE, showWarnings = FALSE)
+
+patch_files <- list.files(paths$patch_dir, pattern = "\\.tif$", full.names = TRUE)
+
+if (!length(patch_files)) {
+  message("No patch rasters found in ", paths$patch_dir, " (nothing to convert).")
+} else {
+  for (f in patch_files) {
+    r <- terra::rast(f)
+
+    # Any non-NA value becomes 1; NA stays NA
+    r_bin <- terra::ifel(is.na(r), NA_integer_, 1L)
+
+    out_f <- file.path(bin_dir, basename(f))
+    terra::writeRaster(
+      r_bin,
+      filename  = out_f,
+      overwrite = TRUE,
+      wopt = list(
+        datatype = "INT1U",
+        gdal = c(
+          "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+          "COMPRESS=LZW", "BIGTIFF=IF_SAFER"
+        )
+      )
+    )
+  }
+
+  message("Wrote binary patch rasters to: ", bin_dir, " (n=", length(patch_files), ")")
+}
+```
+
+```{r}
+# Super simple: plot every patch raster in Data/Clean/Patches_binary
+patch_binary_files <- list.files("Data/Clean/Patches_binary", pattern = "\\.tif$", full.names = TRUE)
+
+for (f in patch_binary_files) {
+  r <- terra::rast(f)
+  plot(r, main = basename(f))
+}
+```

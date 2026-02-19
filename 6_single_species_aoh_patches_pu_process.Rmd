@@ -1,0 +1,503 @@
+---
+title: "6_single_species_aoh_patches_pu_process"
+output: html_document
+---
+
+```{r}
+## ---- 01_validation_and_config -----------------------------------------------
+## Fail-fast setup + ALL precondition/validation checks live here.
+
+# Optional: global chunk defaults (keeps code cleaner downstream)
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+}
+
+# ---- tiny assertions (used ONLY in this chunk)
+assert <- function(ok, msg) if (!isTRUE(ok)) stop(msg, call. = FALSE)
+need_file <- function(path, label = path) assert(file.exists(path), paste0("Missing file: ", label, "\nPath: ", path))
+need_dir  <- function(path, label = path) assert(dir.exists(path),  paste0("Missing directory: ", label, "\nPath: ", path))
+
+# ---- packages (only what is actually used)
+pkgs <- c(
+  "terra", "sf", "igraph", "dplyr", "fasterRaster", "readr", "stringr",
+  "ggplot2", "tidyterra", "patchwork", "rnaturalearth"
+)
+miss <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+assert(length(miss) == 0, paste0("Missing package(s): ", paste(miss, collapse = ", ")))
+
+suppressPackageStartupMessages({
+  library(terra)
+  library(sf)
+  library(igraph)
+  library(dplyr)
+  library(fasterRaster)
+  library(readr)
+  library(stringr)
+
+  library(ggplot2)
+  library(tidyterra)
+  library(patchwork)
+  library(rnaturalearth)
+})
+
+sf::sf_use_s2(TRUE)
+
+# ---- user-set constants
+TARGET_SPECIES <- "Cryptoprocta ferox"
+
+# ---- paths
+paths <- list(
+  species_csv   = "Data/Clean/species_table.csv",
+  landcover_tif = "Data/Raw/esacci_2022_pfts.tif",
+  mammal_dir    = "mammal_ppm_bin",
+  fig_dir       = "Figures"
+)
+
+# ---- ROI
+roi <- terra::ext(43.18, 50.56, -25.64, -11.89)
+assert(inherits(roi, "SpatExtent"), "roi must be a terra::ext() / SpatExtent object.")
+plot_ext <- roi  # plotting extent used by all panels
+
+# ---- GRASS (for fasterRaster::clump)
+grassDir <- "C:/Program Files/GRASS GIS 8.4"
+assert(dir.exists(grassDir), paste0("GRASS directory does not exist:\n", grassDir))
+fasterRaster::faster(grassDir = grassDir)
+
+# ---- required inputs
+need_file(paths$species_csv,   "Data/Clean/species_table.csv")
+need_file(paths$landcover_tif, "Data/Raw/esacci_2022_pfts.tif")
+need_dir(paths$mammal_dir,     "mammal_ppm_bin")
+dir.create(paths$fig_dir, recursive = TRUE, showWarnings = FALSE)
+need_dir(paths$fig_dir, "Figures (output directory)")
+
+# ---- habitat label parser (tiny + used for validation here)
+parse_habitats_mixed <- function(x) {
+  out <- unlist(strsplit(as.character(x), ",", fixed = TRUE))
+  out <- stringr::str_squish(out)
+  out <- out[nzchar(out)]
+  unique(out)
+}
+
+# ---- habitat crosswalk (IUCN label -> mask layer name)
+habitat_map <- c(
+  "Forest"                                       = "forest",
+  "Savanna"                                      = "savanna",
+  "Shrubland"                                    = "shrubland",
+  "Grassland"                                    = "grassland",
+  "Wetlands (inland)"                            = "wetlands_inland",
+  "Rocky Areas"                                  = "rocky_areas",
+  "Desert"                                       = "desert",
+  "Arable & Pastureland"                         = "arable_pastureland",
+  "Plantations & Heavily Degraded Former Forest" = "plantations_degraded_forest",
+  "Urban & Rural Gardens"                        = "urban_rural_gardens",
+  "Artificial - Aquatic"                         = "artificial_aquatic",
+  "Artificial - Terrestrial"                     = "artificial_terrestrial"
+)
+
+# ---- species table validation (done once, here)
+need_cols <- c(
+  "scientificName","className","habitats_mixed","raster_stem",
+  "min_patch_size","min_pop_size","dispersal_dist"
+)
+
+hdr  <- readr::read_csv(paths$species_csv, show_col_types = FALSE, n_max = 0)
+miss <- setdiff(need_cols, names(hdr))
+assert(length(miss) == 0, paste0("species_table.csv missing columns: ", paste(miss, collapse = ", ")))
+
+sp <- readr::read_csv(
+  paths$species_csv, show_col_types = FALSE, progress = FALSE,
+  col_select = dplyr::all_of(need_cols)
+) |>
+  dplyr::mutate(
+    scientificName = stringr::str_squish(as.character(scientificName)),
+    class_lc       = stringr::str_to_lower(stringr::str_squish(as.character(className))),
+    habitats_mixed = stringr::str_squish(as.character(habitats_mixed)),
+    raster_stem    = stringr::str_to_lower(stringr::str_squish(as.character(raster_stem))),
+    min_patch_km2  = suppressWarnings(readr::parse_number(as.character(min_patch_size))),
+    min_pop_km2    = suppressWarnings(readr::parse_number(as.character(min_pop_size))),
+    disp_km        = suppressWarnings(readr::parse_number(as.character(dispersal_dist)))
+  )
+
+row <- sp |> dplyr::filter(scientificName == TARGET_SPECIES) |> dplyr::slice(1)
+assert(nrow(row) == 1, paste0("TARGET_SPECIES not found in species_table.csv: ", TARGET_SPECIES))
+assert(row$class_lc == "mammalia", "This figure script expects the target species to be a mammal row.")
+assert(nzchar(row$habitats_mixed), "habitats_mixed is empty for this species.")
+assert(nzchar(row$raster_stem),    "raster_stem is empty for this species.")
+assert(is.finite(row$min_patch_km2) && row$min_patch_km2 > 0, "min_patch_size is missing/non-positive.")
+assert(is.finite(row$min_pop_km2)   && row$min_pop_km2 > 0,   "min_pop_size is missing/non-positive.")
+assert(is.finite(row$disp_km)       && row$disp_km >= 0,      "dispersal_dist is missing/negative.")
+
+# Parsed habitat labels (used later in plotting subtitles)
+lbls <- parse_habitats_mixed(row$habitats_mixed)
+
+# Presence raster path validation (also precondition)
+pres_path <- file.path(paths$mammal_dir, paste0(row$raster_stem, ".tif"))
+need_file(pres_path, paste0("Presence raster for ", TARGET_SPECIES))
+```
+
+```{r}
+## ---- 02_helpers -------------------------------------------------------------
+## Minimal helpers used by compute + plotting chunks (no validation here).
+
+# Align presence raster to a template grid and coerce to 1/NA
+load_presence_aligned01 <- function(pres_path, template) {
+  r <- terra::rast(pres_path)
+
+  if (!terra::compareGeom(r, template, stopOnError = FALSE)) {
+    if (!terra::same.crs(r, template)) {
+      r <- terra::project(r, template, method = "near")
+    }
+    r <- terra::resample(r, template, method = "near")
+  }
+
+  terra::ifel(r == 1L, 1L, NA_integer_)
+}
+
+# Union of multiple binary mask layers (1 if any layer has 1)
+habitat_union <- function(masks, mask_names) {
+  x <- masks[[mask_names]]
+  if (terra::nlyr(x) == 1) return(x)
+
+  u <- terra::app(x, fun = sum, na.rm = TRUE)
+  terra::ifel(u > 0, 1L, NA_integer_)
+}
+
+# area (km^2) of a 1/NA mask
+area_km2 <- function(mask01) {
+  cs <- terra::cellSize(mask01, unit = "km")
+  a  <- terra::global(terra::ifel(is.na(mask01), NA_real_, cs), "sum", na.rm = TRUE)[1, 1]
+  as.numeric(a)
+}
+
+# Binarize any raster to 1/NA for clean single-colour plotting
+bin01 <- function(r) terra::ifel(r == 1L, 1L, NA_integer_)
+
+# Madagascar outline in the raster CRS
+madagascar_outline <- function(template_rast) {
+  mg <- rnaturalearth::ne_countries(
+    country     = "Madagascar",
+    scale       = "medium",
+    returnclass = "sf"
+  )
+  sf::st_transform(mg, crs = terra::crs(template_rast, proj = TRUE))
+}
+
+# Quiet wrapper to avoid tidyterra “resampled to XXX cells” messages
+geom_spatraster_silent <- function(...) suppressMessages(tidyterra::geom_spatraster(...))
+
+# Shared theme (journal-friendly: clean, consistent borders, no clutter)
+theme_map <- ggplot2::theme_void(base_size = 10) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      hjust  = 0.5, size = 12, face = "bold",
+      margin = ggplot2::margin(b = 2)
+    ),
+    plot.subtitle = ggplot2::element_text(
+      hjust  = 0.5, size = 9,
+      margin = ggplot2::margin(b = 2)
+    ),
+    plot.title.position = "plot",
+    plot.margin  = ggplot2::margin(4, 4, 4, 4),
+    panel.border = ggplot2::element_rect(color = "grey30", fill = NA, linewidth = 0.25)
+  )
+
+# Fixed extent + CRS for all panels (keeps alignment perfect)
+coord_ext <- function(r, e) {
+  ggplot2::coord_sf(
+    crs    = terra::crs(r, proj = TRUE),
+    xlim   = c(e$xmin, e$xmax),
+    ylim   = c(e$ymin, e$ymax),
+    expand = FALSE
+  )
+}
+
+add_mg <- function(mg_sf, col = "grey10", lwd = 0.30) {
+  ggplot2::geom_sf(
+    data        = mg_sf,
+    fill        = NA,
+    color       = col,
+    linewidth   = lwd,
+    inherit.aes = FALSE
+  )
+}
+
+# Single-colour binary raster plot
+bin_plot <- function(r01, title, subtitle = NULL, fill_col,
+                     mg_sf, e, maxcell = 7.5e5) {
+
+  r01 <- bin01(r01)
+
+  ggplot2::ggplot() +
+    geom_spatraster_silent(data = r01, maxcell = maxcell, na.rm = TRUE) +
+    add_mg(mg_sf) +
+    ggplot2::scale_fill_gradient(
+      low      = fill_col,
+      high     = fill_col,
+      na.value = "white",
+      guide    = "none"
+    ) +
+    coord_ext(r01, e) +
+    ggplot2::labs(title = title, subtitle = subtitle) +
+    theme_map
+}
+
+# ID raster plot (continuous or discrete) with OPTIONAL polygon outline overlay.
+# Key visual tweak:
+# - outlines default to *very subtle* alpha + thin linewidth so they do not mask colours.
+id_plot <- function(r_id, title, subtitle = NULL,
+                    mg_sf, e,
+                    discrete = TRUE,
+                    outline_sf  = NULL,
+                    outline_col = scales::alpha("black", 0.12),
+                    outline_lwd = 0.12,
+                    maxcell = 7.5e5,
+                    begin = 0.25, end = 0.90, option = "D") {
+
+  r_plot <- if (discrete) terra::as.factor(r_id) else r_id
+
+  p <- ggplot2::ggplot() +
+    geom_spatraster_silent(data = r_plot, maxcell = maxcell, na.rm = TRUE) +
+    add_mg(mg_sf) +
+    coord_ext(r_plot, e) +
+    ggplot2::labs(title = title, subtitle = subtitle) +
+    theme_map
+
+  # Avoid near-black extremes for a cleaner print tone
+  if (discrete) {
+    p <- p + ggplot2::scale_fill_viridis_d(
+      guide = "none", na.translate = FALSE,
+      begin = begin, end = end, option = option
+    )
+  } else {
+    p <- p + ggplot2::scale_fill_viridis_c(
+      guide = "none", na.value = "white",
+      begin = begin, end = end, option = option
+    )
+  }
+
+  if (!is.null(outline_sf)) {
+    p <- p + ggplot2::geom_sf(
+      data = outline_sf,
+      fill = NA,
+      color = outline_col,
+      linewidth = outline_lwd,
+      inherit.aes = FALSE
+    )
+  }
+
+  p
+}
+```
+
+```{r}
+## ---- 03_compute_layers_single_species ---------------------------------------
+## Core processing (assumes 'row', 'lbls', 'pres_path', 'habitat_map' validated in chunk 01)
+
+# 1) Landcover -> habitat masks (ESA-CCI codes)
+lc     <- terra::rast(paths$landcover_tif)
+lc_roi <- terra::crop(lc, plot_ext, snap = "out")
+rm(lc)
+
+class_map <- list(
+  forest                      = c(50L, 60L, 61L, 62L, 70L, 71L, 72L, 90L, 160L),
+  savanna                     = c(120L, 121L, 122L),
+  shrubland                   = c(120L, 121L, 122L, 150L, 151L, 152L, 153L, 200L, 201L, 202L),
+  grassland                   = c(130L, 140L, 150L, 151L, 152L, 153L),
+  wetlands_inland             = c(20L, 80L, 81L, 82L, 160L, 170L, 180L, 210L),
+  rocky_areas                 = c(70L, 71L, 72L, 130L, 150L, 151L, 152L, 153L, 200L, 201L, 202L),
+  desert                      = c(150L, 151L, 152L, 153L, 200L, 201L, 202L),
+  arable_pastureland          = c(11L, 20L, 190L),
+  plantations_degraded_forest = integer(0),
+  urban_rural_gardens         = c(190L),
+  artificial_aquatic          = c(20L, 160L, 170L, 180L, 190L, 210L)
+)
+class_map$artificial_terrestrial <- unique(c(
+  class_map$arable_pastureland,
+  class_map$urban_rural_gardens,
+  class_map$plantations_degraded_forest
+))
+
+build_habitat_masks_from_lc <- function(lc_roi, class_map) {
+  base <- lc_roi[[1]]
+  out <- lapply(names(class_map), function(nm) {
+    codes <- class_map[[nm]]
+    r <- if (length(codes) == 0L) base * NA_integer_ else terra::ifel(base %in% codes, 1L, NA_integer_)
+    names(r) <- nm
+    r
+  })
+  terra::rast(out)
+}
+
+masks    <- build_habitat_masks_from_lc(lc_roi, class_map)
+template <- masks[[1]]
+
+# 2) Species habitat union (IUCN habitats -> mask layers)
+mask_names <- unname(habitat_map[lbls])
+mask_names <- unique(mask_names[!is.na(mask_names)])
+mask_names <- mask_names[mask_names %in% names(masks)]
+
+hab01  <- habitat_union(masks, mask_names)
+pres01 <- load_presence_aligned01(pres_path, template)
+
+# 3) AOH = habitat ∩ distribution
+aoh01 <- terra::ifel(hab01 == 1L & pres01 == 1L, 1L, NA_integer_)
+
+# 4) Patches (clumped AOH on trimmed extent for speed)
+aoh_trim  <- terra::trim(aoh01)
+cl_fast   <- fasterRaster::clump(fasterRaster::fast(aoh_trim), diagonal = FALSE)
+patch_all <- terra::rast(cl_fast)
+names(patch_all) <- "patch_id"
+
+cell_area_km <- terra::cellSize(aoh_trim, unit = "km")
+area_tab <- terra::zonal(cell_area_km, patch_all, "sum", na.rm = TRUE) |>
+  as.data.frame()
+names(area_tab) <- c("patch_id", "area_km2")
+area_tab <- area_tab[!is.na(area_tab$patch_id), , drop = FALSE]
+n_patches_all <- nrow(area_tab)
+
+# 5) Filter patches by min patch area (species-specific threshold)
+keep_patch     <- area_tab$patch_id[area_tab$area_km2 >= row$min_patch_km2]
+n_patches_kept <- length(keep_patch)
+
+patch_kept <- terra::classify(
+  patch_all,
+  rcl    = cbind(as.integer(keep_patch), seq_along(keep_patch)),
+  others = NA_integer_
+)
+names(patch_kept) <- "patch_id"
+
+patches_tab <- data.frame(
+  patch_id = seq_along(keep_patch),
+  area_km2 = area_tab$area_km2[match(keep_patch, area_tab$patch_id)]
+)
+
+# 6) Population units: cluster patches within dispersal distance, then filter by min PU area
+patch_poly <- sf::st_as_sf(
+  terra::as.polygons(patch_kept, values = TRUE, dissolve = TRUE, na.rm = TRUE)
+)
+patch_poly$patch_id <- as.integer(patch_poly$patch_id)
+patch_poly <- patch_poly[!is.na(patch_poly$patch_id), ]
+
+nb <- sf::st_is_within_distance(patch_poly, patch_poly, dist = row$disp_km * 1000)
+
+g <- igraph::graph_from_adj_list(nb, mode = "all") |>
+  igraph::as_undirected("collapse") |>
+  igraph::simplify(remove.multiple = TRUE, remove.loops = TRUE)
+
+comp <- igraph::components(g)$membership
+patch_poly$pu_unfiltered <- as.integer(factor(comp))
+
+patch_area_df <- dplyr::left_join(
+  patches_tab,
+  dplyr::select(sf::st_drop_geometry(patch_poly), patch_id, pu_unfiltered),
+  by = "patch_id"
+)
+
+pu_area <- patch_area_df |>
+  dplyr::group_by(pu_unfiltered) |>
+  dplyr::summarise(pu_area_km2 = sum(area_km2, na.rm = TRUE), .groups = "drop")
+
+keep_pu   <- sort(pu_area$pu_unfiltered[pu_area$pu_area_km2 >= row$min_pop_km2])
+n_pu_kept <- length(keep_pu)
+
+patch_poly$pu_final <- match(patch_poly$pu_unfiltered, keep_pu)
+
+patch_to_pu <- dplyr::select(sf::st_drop_geometry(patch_poly), patch_id, pu_final)
+patch_to_pu <- patch_to_pu[!is.na(patch_to_pu$pu_final), , drop = FALSE]
+
+pu_rast <- patch_kept * NA_integer_
+if (nrow(patch_to_pu) > 0) {
+  pu_rast <- terra::classify(
+    patch_kept,
+    rcl    = cbind(as.integer(patch_to_pu$patch_id), as.integer(patch_to_pu$pu_final)),
+    others = NA_integer_
+  )
+}
+names(pu_rast) <- "pu_id"
+
+# Optional outlines (used only if you pass them into id_plot)
+patch_sf <- patch_poly
+units_sf <- tryCatch(
+  patch_poly |>
+    dplyr::filter(!is.na(pu_final)) |>
+    dplyr::group_by(pu_final) |>
+    dplyr::summarise(geometry = sf::st_union(geometry), .groups = "drop"),
+  error = function(e) NULL
+)
+
+# 7) Crop to plotting extent
+hab01_c      <- terra::crop(hab01,      plot_ext, snap = "out")
+pres01_c     <- terra::crop(pres01,     plot_ext, snap = "out")
+aoh01_c      <- terra::crop(aoh01,      plot_ext, snap = "out")
+patch_all_c  <- terra::crop(patch_all,  plot_ext, snap = "out")
+patch_kept_c <- terra::crop(patch_kept, plot_ext, snap = "out")
+pu_rast_c    <- terra::crop(pu_rast,    plot_ext, snap = "out")
+```
+
+```{r, fig.width=12, fig.height=7, dpi=300, message=FALSE, warning=FALSE}
+## ---- 04_make_figure_ggplot --------------------------------------------------
+## Publication-style 6-panel process figure (minimal + consistent)
+
+mg_sf <- madagascar_outline(hab01_c)
+e     <- plot_ext
+
+# Colours (close to OLD style)
+COL_HAB  <- "#8FB996"
+COL_PRES <- "#CC79A7"
+COL_AOH  <- "#335C67"
+
+pA <- bin_plot(
+  hab01_c, "Habitat",
+  paste0("habitats: ", paste(lbls, collapse = ", ")),
+  COL_HAB, mg_sf, e
+)
+
+pB <- bin_plot(pres01_c, "Distribution", NULL, COL_PRES, mg_sf, e)
+
+pC <- bin_plot(
+  aoh01_c, "AOH",
+  sprintf("AOH: %.0f km²", area_km2(aoh01_c)),
+  COL_AOH, mg_sf, e
+)
+
+# (d) continuous avoids an enormous discrete palette for ~38k patches
+pD <- id_plot(
+  patch_all_c, "Patches", sprintf("n = %d", n_patches_all),
+  mg_sf, e, discrete = FALSE,
+  begin = 0.30, end = 0.90
+)
+
+# (e) and (f): outlines kept OPTIONAL but now default to subtle alpha+thin linewidth
+pE <- id_plot(
+  patch_kept_c, "Filtered patches", sprintf("kept = %d", n_patches_kept),
+  mg_sf, e, discrete = TRUE,
+  outline_sf = patch_sf,
+  begin = 0.30, end = 0.90
+)
+
+pF <- id_plot(
+  pu_rast_c, "Population units", sprintf("PUs = %d", n_pu_kept),
+  mg_sf, e, discrete = TRUE,
+  outline_sf = units_sf,
+  begin = 0.30, end = 0.90
+)
+
+fig <- (pA + pB + pC) / (pD + pE + pF) +
+  patchwork::plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")",
+    theme = ggplot2::theme(
+      plot.tag = ggplot2::element_text(face = "bold", size = 12),
+      plot.tag.position = c(0.02, 0.98)
+    )
+  )
+
+fig
+
+# Optional (recommended for journal submission): save a high-res raster + a vector PDF.
+# ggplot2::ggsave(file.path(paths$fig_dir, "cf_process_figure.png"), fig,
+#                 width = 12, height = 7, dpi = 600, bg = "white")
+# ggplot2::ggsave(file.path(paths$fig_dir, "cf_process_figure.pdf"), fig,
+#                 width = 12, height = 7, bg = "white")
+```

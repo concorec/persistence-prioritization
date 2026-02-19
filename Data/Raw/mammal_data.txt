@@ -5399,3 +5399,6 @@ MSW3_ID	Scientific	MSWFamilyLatin	Diet-Inv	Diet-Vend	Diet-Vect	Diet-Vfish	Diet-V
 5417	Lipotes vexillifer	Iniidae	0	0	0	100	0	0	0	0	0	0	Ref_1	ABC	M	A	Freshwater	0	0	1	Ref_1	ABC	83500	Ref_117	1
 5418	Pontoporia blainvillei	Iniidae	40	0	0	60	0	0	0	0	0	0	Ref_1	ABC	M	A		0	0	1	Ref_3	D2	40500	Ref_117	1
 9991	Crocidura lasiura	Soricidae	50	0	10	0	0	40	0	0	0	0	Ref_1	ABC	G	A		1	0	0	Ref_1	ABC	14.8	Ref_117	1
+																									
+																									
+																									

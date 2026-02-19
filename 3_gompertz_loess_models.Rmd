@@ -1,0 +1,1828 @@
+
+
+---
+title: "3_gompertz_loess_models"
+output: html_document
+---
+
+```{r}
+## ---- sanity_precondition_validation_checks ---------------------------------
+## Purpose: the ONLY place in this Rmd where we do precondition/validation/sanity checks.
+## After this chunk succeeds, the rest of the Rmd must contain ZERO assertions/checks.
+##
+## Contract for this Rmd (minimal outputs):
+##   - Figures/diagnostics are DISPLAYED in the knitted document only (never written to disk).
+##   - The ONLY file this Rmd may write is the final LOESS model object (RDS),
+##     because it is a minimal downstream input to spatial prioritization.
+
+# =============================================================================
+# 0) Tiny assertion helpers
+# =============================================================================
+assert <- function(ok, msg) if (!isTRUE(ok)) stop(msg, call. = FALSE)
+
+assert_has_cols <- function(df, cols, label) {
+  miss <- setdiff(cols, names(df))
+  assert(length(miss) == 0, paste0(label, " missing column(s): ", paste(miss, collapse = ", ")))
+}
+
+assert_file_exists <- function(path, label = path) {
+  assert(file.exists(path), paste0("Missing required file: ", label, "\nPath: ", path))
+}
+
+assert_dir_writable <- function(dir_path, label = dir_path) {
+  if (!dir.exists(dir_path)) {
+    ok <- dir.create(dir_path, recursive = TRUE, showWarnings = FALSE)
+    assert(ok, paste0("Could not create directory: ", label, "\nPath: ", dir_path))
+  }
+  tf <- tempfile("write_test_", tmpdir = dir_path, fileext = ".tmp")
+  ok <- tryCatch(isTRUE(file.create(tf)), error = function(e) FALSE)
+  if (isTRUE(ok)) unlink(tf)
+  assert(ok, paste0("Directory is not writable: ", label, "\nPath: ", dir_path))
+}
+
+# =============================================================================
+# 1) Configuration (single source of truth)
+# =============================================================================
+DO_MAMMALS <- TRUE
+DO_BIRDS   <- TRUE  # set TRUE only if bird simulations exist
+
+CURVES <- c("q50", "q16", "q025")
+K0     <- 500        # fixed shift (must remain exactly 500)
+
+# LOESS smoothing constants (single source of truth; used for saved models + LOESS figures)
+SPAN_LOESS <- 0.8
+Z_LOESS    <- 1.96  # ~95% interval from LOESS SE
+
+# Only persisted artifact from this Rmd (required downstream)
+WRITE_LOESS_MODELS <- TRUE
+
+# Inputs from Rmd #2 (both are "persistence points" tables)
+PATHS <- list(
+  # inputs (from Rmd #2)
+  mammals_points    = "Data/Results/persist_points_mammals.csv",
+  birds_points      = "Data/Results/persist_points_birds.csv",
+
+  # output (minimal downstream input)
+  loess_models_rds  = "Data/Clean/gompertz_loess_models.rds"
+)
+
+# =============================================================================
+# 2) Package preconditions
+# =============================================================================
+pkgs_needed <- c("dplyr", "readr", "tibble", "ggplot2", "cowplot", "scales", "viridisLite")
+missing_pkgs <- pkgs_needed[!vapply(pkgs_needed, requireNamespace, logical(1), quietly = TRUE)]
+assert(
+  length(missing_pkgs) == 0,
+  paste0(
+    "Missing required R package(s): ", paste(missing_pkgs, collapse = ", "),
+    "\nInstall them with: install.packages(c(",
+    paste0('"', missing_pkgs, '"', collapse = ", "),
+    "))"
+  )
+)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(ggplot2)
+  library(cowplot)
+  library(scales)
+  library(viridisLite)
+})
+
+# =============================================================================
+# 3) Knob sanity + filesystem + input-file preconditions
+# =============================================================================
+assert(is.logical(DO_MAMMALS) && length(DO_MAMMALS) == 1, "DO_MAMMALS must be TRUE/FALSE.")
+assert(is.logical(DO_BIRDS)   && length(DO_BIRDS)   == 1, "DO_BIRDS must be TRUE/FALSE.")
+assert(isTRUE(DO_MAMMALS) || isTRUE(DO_BIRDS),
+       "At least one of DO_MAMMALS or DO_BIRDS must be TRUE.")
+
+assert(is.numeric(K0) && length(K0) == 1 && K0 == 500, "K0 must be exactly 500 (fixed shift).")
+assert(all(CURVES %in% c("q50", "q16", "q025")),
+       "CURVES must be a subset of c('q50','q16','q025').")
+
+assert(is.logical(WRITE_LOESS_MODELS) && length(WRITE_LOESS_MODELS) == 1,
+       "WRITE_LOESS_MODELS must be TRUE/FALSE.")
+
+# Only verify writable output location if we plan to write the LOESS model object
+if (isTRUE(WRITE_LOESS_MODELS)) {
+  assert_dir_writable(dirname(PATHS$loess_models_rds), label = dirname(PATHS$loess_models_rds))
+}
+
+# Required inputs depend on flags.
+# Both inputs are produced by Untitled2 with schema:
+#   combo, mass_idx, mass_g, curve, K, p_eval
+need_cols <- c("combo", "mass_idx", "mass_g", "curve", "K", "p_eval")
+
+if (isTRUE(DO_MAMMALS)) {
+  assert_file_exists(PATHS$mammals_points, "PATHS$mammals_points")
+  hdr <- readr::read_csv(PATHS$mammals_points, show_col_types = FALSE, n_max = 1)
+  assert_has_cols(hdr, need_cols, "persist_points_mammals.csv")
+}
+
+if (isTRUE(DO_BIRDS)) {
+  assert_file_exists(PATHS$birds_points, "PATHS$birds_points")
+  hdrb <- readr::read_csv(PATHS$birds_points, show_col_types = FALSE, n_max = 1)
+  assert_has_cols(hdrb, need_cols, "persist_points_birds.csv")
+}
+
+message(
+  "Validation OK | DO_MAMMALS=", DO_MAMMALS,
+  " DO_BIRDS=", DO_BIRDS,
+  " | K0=", K0,
+  " | WRITE_LOESS_MODELS=", WRITE_LOESS_MODELS
+)
+```
+
+```{r}
+## ---- helpers_core_no_checks -------------------------------------------------
+## Pure helpers: NO validation/checks here.
+## Keep this file small and readable; every helper exists because a later chunk uses it.
+
+# =============================================================================
+# A) Plot styling (used by multiple figures)
+# =============================================================================
+theme_pub <- function(base_size = 12) {
+  ggplot2::theme_classic(base_size = base_size) +
+    ggplot2::theme(
+      plot.margin  = ggplot2::margin(6, 6, 6, 6),
+      axis.title   = ggplot2::element_text(face = "bold"),
+      axis.text    = ggplot2::element_text(color = "grey15"),
+      axis.line    = ggplot2::element_line(linewidth = 0.4, color = "grey15"),
+      axis.ticks   = ggplot2::element_line(linewidth = 0.4, color = "grey15"),
+      legend.title = ggplot2::element_text(face = "bold"),
+      plot.title   = ggplot2::element_text(face = "bold", hjust = 0.5)
+    )
+}
+
+# =============================================================================
+# B) Small numeric utilities
+# =============================================================================
+clamp01   <- function(p) pmin(pmax(p, 1e-8), 1 - 1e-8)
+log_space <- function(x_min, x_max, n) 10^seq(log10(x_min), log10(x_max), length.out = n)
+
+# =============================================================================
+# C) Shifted Gompertz persistence model
+#     p(K) = exp( -alpha * (K - K0)^(-beta) ), for K > K0
+# =============================================================================
+predict_p <- function(alpha, beta, K, K0 = 500) {
+  x <- pmax(K - K0, 1e-12)
+  exp(-alpha * x^(-beta))
+}
+
+# Fit alpha,beta by NLS on the Gompertz form above.
+# Returns a small list with fit status + diagnostics (for in-Rmd printing only).
+fit_gompertz_ab <- function(K, p_eval, K0 = 500) {
+  df <- data.frame(K = as.numeric(K), p = clamp01(as.numeric(p_eval)))
+  df <- df[is.finite(df$K) & is.finite(df$p) & df$K > K0, , drop = FALSE]
+
+  x  <- pmax(df$K - K0, 1e-12)
+  y  <- log(-log(df$p))
+  lx <- log(x)
+
+  # cheap start via linearization: y = log(alpha) - beta * log(x)
+  lm0    <- stats::lm(y ~ lx)
+  beta0  <- -as.numeric(stats::coef(lm0)[["lx"]])
+  alpha0 <-  exp(as.numeric(stats::coef(lm0)[["(Intercept)"]]))
+
+  if (!is.finite(beta0)  || beta0  <= 0) beta0  <- 1
+  if (!is.finite(alpha0) || alpha0 <= 0) alpha0 <- 1
+
+  fml  <- p ~ exp(-exp(log_alpha) * (pmax(K - K0, 1e-12))^(-exp(log_beta)))
+  ctrl <- stats::nls.control(maxiter = 400, tol = 1e-7, minFactor = 1/2048, warnOnly = TRUE)
+
+  # try a small grid around beta0; pick alpha using a mid-probability point
+  mult <- c(0.6, 0.85, 1, 1.25, 1.7, 2.5, 4)
+  beta_grid <- unique(pmax(1e-4, pmin(80, beta0 * mult)))
+
+  i_mid <- which.min(abs(df$p - 0.5))
+  fit <- NULL
+
+  for (b_try in beta_grid) {
+    a_try <- -log(df$p[i_mid]) * (pmax(df$K[i_mid] - K0, 1e-12))^(b_try)
+    if (!is.finite(a_try) || a_try <= 0) a_try <- alpha0
+
+    fit <- tryCatch(
+      stats::nls(
+        fml,
+        data      = df,
+        start     = list(log_alpha = log(a_try), log_beta = log(b_try)),
+        algorithm = "port",
+        control   = ctrl
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(fit)) break
+  }
+
+  if (is.null(fit)) {
+    return(list(alpha = NA_real_, beta = NA_real_, ok = FALSE, msg = "NLS failed", rmse_lin = NA_real_, n = nrow(df)))
+  }
+
+  co <- stats::coef(fit)
+  alpha_hat <- exp(as.numeric(co[["log_alpha"]]))
+  beta_hat  <- exp(as.numeric(co[["log_beta"]]))
+
+  p_hat <- predict_p(alpha_hat, beta_hat, df$K, K0 = K0)
+  rmse_lin <- sqrt(mean((log(-log(df$p)) - log(-log(clamp01(p_hat))))^2))
+
+  list(alpha = alpha_hat, beta = beta_hat, ok = TRUE, msg = "", rmse_lin = rmse_lin, n = nrow(df))
+}
+
+# =============================================================================
+# D) LOESS on log-parameters (used to build downstream LOESS model object + plots)
+# =============================================================================
+fit_loess_logparam <- function(mass_g, param_pos, span = 0.8) {
+  df <- data.frame(logM = log10(as.numeric(mass_g)), lp = log(as.numeric(param_pos)))
+  stats::loess(lp ~ logM, data = df, span = span, degree = 2, family = "gaussian")
+}
+
+predict_loess_exp <- function(fit, mass_g, z = 1.96) {
+  nd <- data.frame(logM = log10(as.numeric(mass_g)))
+  pr <- stats::predict(fit, newdata = nd, se = TRUE)
+  tibble::tibble(
+    mass_g = as.numeric(mass_g),
+    mid    = exp(pr$fit),
+    lo     = exp(pr$fit - z * pr$se.fit),
+    hi     = exp(pr$fit + z * pr$se.fit)
+  )
+}
+
+# =============================================================================
+# E) Figure convenience helpers
+# =============================================================================
+
+# Mass labels for titles / axes (kept simple + readable)
+fmt_mass_label <- function(mass_g) {
+  if (!is.finite(mass_g)) return("Mass: NA")
+  if (mass_g < 1000) return(paste0("Mass: ", scales::label_number(accuracy = 1)(mass_g), " g"))
+  kg  <- mass_g / 1000
+  acc <- if (kg >= 100) 1 else 0.1
+  paste0("Mass: ", scales::label_number(accuracy = acc, big.mark = ",")(kg), " kg")
+}
+
+fmt_mass_axis <- function(x) {
+  x <- as.numeric(x)
+  out <- rep(NA_character_, length(x))
+  ok  <- is.finite(x)
+  if (!any(ok)) return(out)
+
+  x_ok <- x[ok]
+  is_g <- x_ok < 1000
+  out_ok <- character(length(x_ok))
+
+  if (any(is_g)) {
+    out_ok[is_g] <- paste0(scales::label_number(accuracy = 1, big.mark = ",")(x_ok[is_g]), " g")
+  }
+  if (any(!is_g)) {
+    kg  <- x_ok[!is_g] / 1000
+    acc <- ifelse(kg >= 100, 1, 0.1)
+    out_ok[!is_g] <- paste0(scales::label_number(accuracy = acc, big.mark = ",")(kg), " kg")
+  }
+
+  out[ok] <- out_ok
+  out
+}
+
+# Mammal-only K range helper (used to standardize axes across mammal figures)
+mammal_K_range <- function(curves_tbl, curve_use) {
+  rng <- curves_tbl |>
+    dplyr::filter(group == "Mammals", curve == curve_use) |>
+    dplyr::summarise(K_min = min(K, na.rm = TRUE), K_max = max(K, na.rm = TRUE))
+  list(K_min = as.numeric(rng$K_min), K_max = as.numeric(rng$K_max))
+}
+
+# Ensure the left bound works on a log axis and is strictly > K0.
+safe_K_left <- function(K_left, K0) {
+  K_left_safe <- max(as.numeric(K_left), 1e-6)
+  if (is.finite(K0) && K_left_safe <= K0) K_left_safe <- max(K_left_safe, K0 * 1.0005)
+  K_left_safe
+}
+
+# Build fitted curves for a set of masses (one curve per mass_idx) on a common K grid.
+build_fitted_curves <- function(pm, K_grid, K0) {
+  pm |>
+    dplyr::mutate(
+      mass_g = as.numeric(mass_g),
+      logM   = log10(as.numeric(mass_g))
+    ) |>
+    dplyr::arrange(logM) |>
+    dplyr::group_by(mass_idx, mass_g, logM) |>
+    dplyr::group_modify(~{
+      a <- .x$alpha[1]
+      b <- .x$beta[1]
+      tibble::tibble(K = K_grid, p = predict_p(a, b, K_grid, K0 = K0))
+    }) |>
+    dplyr::ungroup()
+}
+
+# Mass legend settings (used by both S2 variants)
+mass_legend_breaks <- function(pm,
+                              idx = c(1L, 16L, 31L),
+                              labels = c("2 g", "3.1 kg", "4,750 kg")) {
+  logM_all <- if ("logM" %in% names(pm)) as.numeric(pm$logM) else log10(as.numeric(pm$mass_g))
+
+  g <- pm |>
+    dplyr::filter(mass_idx %in% idx) |>
+    dplyr::arrange(mass_idx) |>
+    dplyr::pull(mass_g)
+
+  list(
+    limits = range(logM_all, na.rm = TRUE),
+    breaks = log10(as.numeric(g)),
+    labels = labels
+  )
+}
+
+# Stable K tick marks across plots (falls back if too few ticks in-range)
+tick_K <- function(K_max, K_left_safe) {
+  breaksK <- c(500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000)
+  breaksK <- breaksK[breaksK >= K_left_safe & breaksK <= K_max * 1.001]
+  if (length(breaksK) < 3) {
+    breaksK <- scales::breaks_log(n = 4)(c(K_left_safe, K_max))
+    breaksK <- breaksK[is.finite(breaksK) & breaksK >= K_left_safe & breaksK <= K_max * 1.001]
+  }
+  breaksK
+}
+
+# =============================================================================
+# E2) R² key layout helper (used by Fig 3 panels)
+# =============================================================================
+r2_key_layout <- function(K0, K_max,
+                          x_box   = c(0.04, 0.40),
+                          x_seg   = c(0.07, 0.18),
+                          x_num   = 0.21,
+                          y_box   = c(0.78, 0.98),
+                          y_title = 0.98,
+                          y_vals  = c(0.90, 0.84)) {
+  logL <- log10(K0)
+  logR <- log10(K_max)
+  rng  <- logR - logL
+  list(
+    box_x0  = 10^(logL + x_box[1] * rng),
+    box_x1  = 10^(logL + x_box[2] * rng),
+    seg_x0  = 10^(logL + x_seg[1] * rng),
+    seg_x1  = 10^(logL + x_seg[2] * rng),
+    num_x   = 10^(logL + x_num * rng),
+    box_y0  = y_box[1],
+    box_y1  = y_box[2],
+    y_title = y_title,
+    y_vals  = y_vals
+  )
+}
+
+
+# =============================================================================
+# F) Wolff specification helpers (used only in Fig 3)
+# =============================================================================
+p_wolff <- function(K, c, A) exp(-A * exp(-c * K))
+
+r2_prob <- function(y, yhat) {
+  rss <- sum((y - yhat)^2, na.rm = TRUE)
+  tss <- sum((y - mean(y, na.rm = TRUE))^2, na.rm = TRUE)
+  if (is.finite(tss) && tss > 0) 1 - rss / tss else NA_real_
+}
+
+fit_wolff_c_start <- function(K, p, A) {
+  p <- clamp01(p)
+  y <- log(-log(p)) - log(A)
+  fit <- stats::lm(y ~ 0 + K)
+  c0 <- -as.numeric(stats::coef(fit)[["K"]])
+  if (!is.finite(c0) || c0 <= 0) c0 <- 1e-8
+  c0
+}
+
+# Fit Wolff c by port-NLS with a few deterministic restarts.
+# Note: This function may stop() if all attempts fail (kept as-is for diagnostic figures).
+fit_wolff_c_nls <- function(K, p, A = 10) {
+  p <- clamp01(p)
+
+  c0     <- fit_wolff_c_start(K, p, A = A)
+  c_grid <- c0 * c(0.25, 0.5, 1, 2, 4)
+
+  attempt <- function(c_start, iters = 250) {
+    suppressWarnings(
+      try(
+        stats::nls(
+          p ~ exp(-A * exp(-c * K)),
+          start     = list(c = c_start),
+          algorithm = "port",
+          lower     = c(c = 1e-12),
+          control   = stats::nls.control(warnOnly = TRUE, maxiter = iters)
+        ),
+        silent = TRUE
+      )
+    )
+  }
+
+  for (cc in c_grid) {
+    fit <- attempt(cc)
+    if (!inherits(fit, "try-error") &&
+        !is.null(fit$convInfo) && isTRUE(fit$convInfo$isConv)) {
+      return(as.numeric(stats::coef(fit)[["c"]]))
+    }
+  }
+
+  old_seed <- if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+    get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  } else NULL
+  on.exit({
+    if (is.null(old_seed)) {
+      if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) rm(".Random.seed", envir = .GlobalEnv)
+    } else {
+      assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+
+  set.seed(123)
+  for (j in 1:20) {
+    cc  <- c0 * exp(stats::runif(1, log(0.2), log(5)))
+    fit <- attempt(cc, iters = 350)
+    if (!inherits(fit, "try-error") &&
+        !is.null(fit$convInfo) && isTRUE(fit$convInfo$isConv)) {
+      return(as.numeric(stats::coef(fit)[["c"]]))
+    }
+  }
+
+  stop("Wolff NLS fit failed for this panel.")
+}
+```
+
+```{r}
+## ---- load_simulation_curves -------------------------------------------------
+## Purpose: read simulation outputs (mammals and/or birds) into one long table.
+## Note: all file/column existence checks live in the top "sanity" chunk.
+
+# --- Mammals: points table (from Rmd #2) -------------------------------------
+mammals <- if (isTRUE(DO_MAMMALS)) {
+  readr::read_csv(PATHS$mammals_points, show_col_types = FALSE) |>
+    dplyr::mutate(group = "Mammals")
+} else {
+  tibble::tibble()
+}
+
+# --- Birds: single points table with `combo` column (from Rmd #2) ------------
+birds <- if (isTRUE(DO_BIRDS)) {
+  readr::read_csv(PATHS$birds_points, show_col_types = FALSE) |>
+    dplyr::mutate(group = "Birds")
+} else {
+  tibble::tibble()
+}
+
+# --- Combined, standardized columns ------------------------------------------
+# Untitled2 already writes the final schema we need:
+#   combo, mass_idx, mass_g, curve, K, p_eval
+curves <- dplyr::bind_rows(mammals, birds) |>
+  dplyr::filter(curve %in% CURVES) |>
+  dplyr::transmute(
+    group    = as.character(group),
+    combo    = as.character(combo),
+    mass_idx = as.integer(mass_idx),
+    mass_g   = as.numeric(mass_g),
+    curve    = as.character(curve),
+    K        = as.numeric(K),
+    p_eval   = as.numeric(p_eval)
+  )
+
+message("Loaded curve rows: ", nrow(curves))
+```
+
+```{r}
+## ---- fit_gompertz_parameters ------------------------------------------------
+## Purpose: fit shifted-Gompertz (alpha, beta) for each (group, combo, mass, curve).
+## Output: kept in-memory for figures + for later LOESS model building.
+## Note: nothing is written to disk here.
+
+params <- curves |>
+  dplyr::group_by(group, combo, mass_idx, mass_g, curve) |>
+  dplyr::group_modify(function(.x, .g) {
+    fit <- fit_gompertz_ab(.x$K, .x$p_eval, K0 = K0)
+
+    tibble::tibble(
+      alpha    = fit$alpha,
+      beta     = fit$beta,
+      fit_ok   = fit$ok,
+      n_pts    = as.integer(fit$n),
+      rmse_lin = as.numeric(fit$rmse_lin),
+      fit_msg  = fit$msg
+    )
+  }) |>
+  dplyr::ungroup()
+
+message(
+  "Gompertz fits: ok=",   sum(params$fit_ok, na.rm = TRUE),
+  " fail=",              sum(!params$fit_ok, na.rm = TRUE)
+)
+```
+
+```{r}
+## ---- loess_params_mammals_and_birds -----------------------------------------
+## Purpose:
+##  (1) Fit (and optionally save) LOESS models: log(alpha), log(beta) ~ log10(mass_g) for each curve.
+##  (2) Build an in-memory prediction grid (loess_pred) used by downstream figure chunks.
+## Notes:
+##  - This chunk does not perform any validation/assertions (those live only in the top chunk).
+##  - The ONLY on-disk output from this Rmd is the single LOESS-model RDS (Option A).
+
+# --- small local helpers (no checks; just convenience) ------------------------
+
+# keep only the columns we need; drop non-finite / non-positive values
+prep_params <- function(x) {
+  x |>
+    dplyr::transmute(
+      combo  = as.character(combo),
+      curve  = as.character(curve),
+      mass_g = as.numeric(mass_g),
+      alpha  = as.numeric(alpha),
+      beta   = as.numeric(beta)
+    ) |>
+    dplyr::filter(
+      is.finite(mass_g), mass_g > 0,
+      is.finite(alpha),  alpha  > 0,
+      is.finite(beta),   beta   > 0
+    )
+}
+
+# fit one curve -> list(alpha_loess, beta_loess, n_points)
+fit_curve_loess <- function(d) {
+  list(
+    alpha = tryCatch(fit_loess_logparam(d$mass_g, d$alpha, span = SPAN_LOESS), error = function(e) NULL),
+    beta  = tryCatch(fit_loess_logparam(d$mass_g, d$beta,  span = SPAN_LOESS), error = function(e) NULL),
+    n     = nrow(d)
+  )
+}
+
+# fit all curves for a group/combo -> named list over CURVES
+fit_group_loess <- function(p_sub) {
+  p_sub <- prep_params(p_sub)
+  stats::setNames(
+    lapply(CURVES, function(cc) fit_curve_loess(dplyr::filter(p_sub, curve == cc))),
+    CURVES
+  )
+}
+
+# predictions for one curve, using already-fitted loess objects
+pred_curve <- function(fit_obj, mass_grid, curve_name) {
+  if (is.null(fit_obj$alpha) || is.null(fit_obj$beta)) return(NULL)
+
+  a <- predict_loess_exp(fit_obj$alpha, mass_grid, z = Z_LOESS) |>
+    dplyr::transmute(
+      mass_g    = as.numeric(mass_g),
+      curve     = curve_name,
+      alpha_mid = as.numeric(mid),
+      alpha_lo  = as.numeric(lo),
+      alpha_hi  = as.numeric(hi)
+    )
+
+  b <- predict_loess_exp(fit_obj$beta, mass_grid, z = Z_LOESS) |>
+    dplyr::transmute(
+      mass_g   = as.numeric(mass_g),
+      curve    = curve_name,
+      beta_mid = as.numeric(mid),
+      beta_lo  = as.numeric(lo),
+      beta_hi  = as.numeric(hi)
+    )
+
+  dplyr::left_join(a, b, by = c("mass_g", "curve"))
+}
+
+# build loess_pred for one group (mammals or one bird combo)
+pred_group <- function(p_sub, fits) {
+  p_sub <- prep_params(p_sub)
+  if (nrow(p_sub) == 0) return(tibble::tibble())
+
+  mass_grid <- log_space(
+    min(p_sub$mass_g, na.rm = TRUE),
+    max(p_sub$mass_g, na.rm = TRUE),
+    n = 700
+  )
+
+  dplyr::bind_rows(lapply(CURVES, function(cc) pred_curve(fits[[cc]], mass_grid, cc)))
+}
+
+# --- fit LOESS models (object to optionally save) -----------------------------
+
+loess_models <- list(
+  meta = list(
+    created_utc = format(Sys.time(), tz = "UTC", usetz = TRUE),
+    K0          = K0,
+    curves      = CURVES,
+    span        = SPAN_LOESS,
+    x_transform = "log10(mass_g)",
+    y_transform = "log(param)"
+  ),
+  mammals = NULL,
+  birds   = NULL
+)
+
+# Mammals
+pm_mammals <- tibble::tibble()
+if (isTRUE(DO_MAMMALS)) {
+  pm_mammals <- params |>
+    dplyr::filter(group == "Mammals", fit_ok)
+
+  loess_models$mammals <- fit_group_loess(pm_mammals)
+}
+
+# Birds (fit per combo)
+pm_birds <- tibble::tibble()
+if (isTRUE(DO_BIRDS)) {
+  pm_birds <- params |>
+    dplyr::filter(group == "Birds", fit_ok)
+
+  by_combo <- split(pm_birds, pm_birds$combo)
+  loess_models$birds <- stats::setNames(lapply(by_combo, fit_group_loess), names(by_combo))
+}
+
+# Save ONLY the final LOESS model object(s)
+if (isTRUE(WRITE_LOESS_MODELS)) {
+  saveRDS(loess_models, file = PATHS$loess_models_rds)
+}
+
+# --- loess_pred grid for downstream figure chunks (in-memory only) ------------
+
+loess_pred <- tibble::tibble()
+
+# Mammals grid
+if (isTRUE(DO_MAMMALS)) {
+  loess_pred <- pred_group(pm_mammals, loess_models$mammals) |>
+    dplyr::mutate(group = "Mammals", combo = NA_character_)
+}
+
+# Birds grid (per combo)
+if (isTRUE(DO_BIRDS) && length(loess_models$birds) > 0) {
+  loess_pred_birds <- dplyr::bind_rows(lapply(names(loess_models$birds), function(cb) {
+    pred_group(dplyr::filter(pm_birds, combo == cb), loess_models$birds[[cb]]) |>
+      dplyr::mutate(group = "Birds", combo = cb)
+  }))
+
+  loess_pred <- dplyr::bind_rows(loess_pred, loess_pred_birds)
+}
+```
+
+```{r}
+## ---- fig3_mammals_wolff_vs_shifted_gompertz --------------------------------
+## Figure 3 (printed only; NO files written):
+## Simulated persistence points vs
+##   (i) shifted Gompertz fit (K0 fixed)
+##   (ii) Wolff specification (A fixed; c fit per panel)
+##
+## Panel (c) x-axis breaks forced to: 500, 1000, 2000, 4000.
+
+# ---------------------------- figure-specific knobs ---------------------------
+curve_use <- "q50"
+mass_idxs <- c(1L, 16L, 31L)
+A_WOLFF   <- 10
+
+KEY_GOMP  <- "Shifted Gompertz fit"
+KEY_WOLFF <- "Wolff specification"
+KEY_PTS   <- "Simulated points"
+
+col_gomp  <- "#0072B2"
+col_wolff <- "grey30"
+col_pts   <- "grey80"
+col_k0    <- "grey90"
+
+pt_alpha  <- 0.80
+pt_size   <- 1.9
+
+lwd_gomp  <- 1.10
+lwd_wolff <- 0.75
+lty_wolff <- "22"
+lwd_k0    <- 0.55
+lty_k0    <- "dotted"
+
+# ---------------------------- data: points + fitted parameters ----------------
+df <- curves |>
+  dplyr::filter(group == "Mammals", curve == curve_use, mass_idx %in% mass_idxs) |>
+  dplyr::select(group, mass_idx, mass_g, curve, K, p_eval) |>
+  dplyr::inner_join(
+    params |>
+      dplyr::filter(group == "Mammals", curve == curve_use, mass_idx %in% mass_idxs, fit_ok) |>
+      dplyr::select(group, mass_idx, mass_g, curve, alpha, beta),
+    by = c("group", "mass_idx", "mass_g", "curve")
+  )
+
+series_levels <- c(KEY_GOMP, KEY_WOLFF, KEY_PTS)
+series_cols   <- stats::setNames(c(col_gomp, col_wolff, col_pts), series_levels)
+
+# ---------------------------- panel builder -----------------------------------
+make_panel <- function(midx, show_y = TRUE, show_legend = FALSE) {
+  dfi <- df |> dplyr::filter(mass_idx == midx)
+
+  mass_g <- dfi$mass_g[1]
+  alpha  <- dfi$alpha[1]
+  beta   <- dfi$beta[1]
+
+  # Wolff fit (will error if the fit fails; see helper)
+  c_hat <- fit_wolff_c_nls(dfi$K, dfi$p_eval, A = A_WOLFF)
+
+  # common K grid for both model curves
+  K_max  <- max(dfi$K, na.rm = TRUE)
+  K_grid <- exp(seq(log(K0 * 1.0005), log(K_max), length.out = 600))
+
+  # model curves + points
+  line_gomp <- tibble::tibble(K = K_grid, p = predict_p(alpha, beta, K_grid, K0 = K0), Series = KEY_GOMP)
+  line_wolff <- tibble::tibble(K = K_grid, p = p_wolff(K_grid, c_hat, A = A_WOLFF),     Series = KEY_WOLFF)
+  pts_here  <- dfi |> dplyr::transmute(K = K, p = p_eval, Series = KEY_PTS)
+
+  # R² for each model (shown as a small in-panel key)
+  r2_g <- r2_prob(dfi$p_eval, predict_p(alpha, beta, dfi$K, K0 = K0))
+  r2_w <- r2_prob(dfi$p_eval, p_wolff(dfi$K, c_hat, A = A_WOLFF))
+
+  r2_geo <- r2_key_layout(K0 = K0, K_max = K_max)
+  r2_key <- tibble::tibble(
+    Series = factor(c(KEY_GOMP, KEY_WOLFF), levels = c(KEY_GOMP, KEY_WOLFF)),
+    y      = r2_geo$y_vals,
+    label  = formatC(c(r2_g, r2_w), digits = 3, format = "f"),
+    x0     = r2_geo$seg_x0,
+    x1     = r2_geo$seg_x1,
+    x_txt  = r2_geo$num_x
+  )
+
+  # panel C: force specific x-axis breaks (if they fall within the K range)
+  breaks_x <- NULL
+  if (midx == mass_idxs[3]) {
+    bx <- c(500, 1000, 2000, 4000)
+    breaks_x <- bx[bx >= min(dfi$K, na.rm = TRUE) & bx <= K_max * 1.02]
+  }
+
+  ggplot2::ggplot() +
+    ggplot2::geom_point(
+      data = pts_here,
+      ggplot2::aes(x = K, y = p, color = Series),
+      alpha = pt_alpha, size = pt_size
+    ) +
+    ggplot2::geom_line(
+      data = line_gomp,
+      ggplot2::aes(x = K, y = p, color = Series),
+      linewidth = lwd_gomp, na.rm = TRUE
+    ) +
+    ggplot2::geom_line(
+      data = line_wolff,
+      ggplot2::aes(x = K, y = p, color = Series),
+      linewidth = lwd_wolff, linetype = lty_wolff, na.rm = TRUE
+    ) +
+    ggplot2::geom_vline(
+      xintercept = K0,
+      linewidth  = lwd_k0,
+      linetype   = lty_k0,
+      color      = col_k0
+    ) +
+    # R² inset (white backing + labels + tiny line samples)
+    ggplot2::annotate(
+      "rect",
+      xmin = r2_geo$box_x0, xmax = r2_geo$box_x1,
+      ymin = r2_geo$box_y0, ymax = r2_geo$box_y1,
+      fill = scales::alpha("white", 0.88),
+      color = NA
+    ) +
+    ggplot2::annotate(
+      "text",
+      x = r2_geo$num_x, y = r2_geo$y_title,
+      label = "R\u00b2",
+      hjust = 0, vjust = 1,
+      fontface = "bold",
+      size = 3.6,
+      color = "grey10"
+    ) +
+    # line samples
+    ggplot2::geom_segment(
+      data = r2_key,
+      ggplot2::aes(x = x0, xend = x1, y = y, yend = y, color = Series, linetype = Series),
+      linewidth = 1.0,
+      show.legend = FALSE
+    ) +
+    # numbers
+    ggplot2::geom_text(
+      data = r2_key,
+      ggplot2::aes(x = x_txt, y = y, label = label),
+      hjust = 0, vjust = 0.5,
+      fontface = "bold",
+      size = 3.6,
+      color = "grey10",
+      show.legend = FALSE
+    ) +
+    ggplot2::scale_linetype_manual(
+      values = stats::setNames(c("solid", lty_wolff), c(KEY_GOMP, KEY_WOLFF)),
+      guide  = "none"
+    ) +
+    ggplot2::scale_x_log10(
+      breaks = if (is.null(breaks_x)) scales::breaks_log(n = 5) else breaks_x,
+      labels = scales::label_comma(),
+      expand = ggplot2::expansion(mult = c(0.03, 0.08))
+    ) +
+    ggplot2::coord_cartesian(ylim = c(0, 1), clip = "off") +
+    ggplot2::scale_color_manual(values = series_cols, breaks = series_levels, name = NULL) +
+    ggplot2::guides(
+      color = ggplot2::guide_legend(
+        nrow = 1, byrow = TRUE,
+        override.aes = list(
+          linetype  = c("solid", lty_wolff, "blank"),
+          shape     = c(NA, NA, 16),
+          linewidth = c(lwd_gomp, lwd_wolff, 0),
+          alpha     = c(1, 1, pt_alpha),
+          size      = c(NA, NA, pt_size)
+        )
+      )
+    ) +
+    ggplot2::labs(
+      title = fmt_mass_label(mass_g),
+      x = "Starting population K",
+      y = if (show_y) "Persistence probability" else NULL
+    ) +
+    theme_pub(base_size = 12) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      legend.position = if (show_legend) "bottom" else "none"
+    )
+}
+
+# ---------------------------- assemble (3 panels + shared legend) -------------
+p_leg  <- make_panel(mass_idxs[1], show_y = TRUE,  show_legend = TRUE)
+legend <- cowplot::get_legend(p_leg)
+
+p1 <- make_panel(mass_idxs[1], show_y = TRUE,  show_legend = FALSE)
+p2 <- make_panel(mass_idxs[2], show_y = FALSE, show_legend = FALSE)
+p3 <- make_panel(mass_idxs[3], show_y = FALSE, show_legend = FALSE)
+
+row_panels <- cowplot::plot_grid(
+  p1, p2, p3,
+  nrow = 1,
+  labels = c("(a)", "(b)", "(c)"),
+  label_fontface = "bold",
+  label_size = 13,
+  align = "hv",
+  axis = "tb"
+)
+
+fig3 <- cowplot::plot_grid(row_panels, legend, ncol = 1, rel_heights = c(1, 0.14))
+
+# Print in the knitted document (no saving)
+fig3
+```
+
+```{r}
+## ---- SI_Fig_S2_all_mammals_log10K_like_Fig3_with_mass_labels_inset_legend ----
+## SI Fig S2 (printed only; NO files written):
+## All 31 mammal fitted persistence curves in ONE panel.
+## - x-axis: log10(K) like Fig 3
+## - inset legend: 2 g, 3.1 kg, 4,750 kg
+## - no simulated points; no Wolff curve; no K0 line
+
+curve_use <- "q50"   # choose from CURVES: "q50", "q16", "q025"
+
+# --- prep (helpers defined earlier; no validation here) -----------------------
+rng <- mammal_K_range(curves, curve_use)
+
+pm <- params |>
+  dplyr::filter(group == "Mammals", curve == curve_use, fit_ok) |>
+  dplyr::select(mass_idx, mass_g, alpha, beta) |>
+  dplyr::arrange(mass_idx) |>
+  dplyr::mutate(logM = log10(mass_g))  # used only for color mapping / legend breaks
+
+K_left_safe <- safe_K_left(rng$K_min, K0)
+K_grid      <- exp(seq(log(K_left_safe), log(rng$K_max), length.out = 900))
+
+df_S2 <- build_fitted_curves(pm, K_grid, K0)
+
+breaksK <- tick_K(rng$K_max, K_left_safe)
+leg     <- mass_legend_breaks(pm)  # list(limits, breaks, labels)
+
+# --- plot --------------------------------------------------------------------
+fig_S2_all_mammals <- ggplot2::ggplot(
+  df_S2,
+  ggplot2::aes(x = K, y = p, group = mass_idx, color = logM)
+) +
+  ggplot2::geom_line(
+    linewidth = 0.95,
+    alpha = 0.92,
+    lineend = "round",
+    na.rm = TRUE
+  ) +
+  ggplot2::coord_cartesian(ylim = c(0, 1), clip = "off") +
+  ggplot2::scale_x_log10(
+    limits = c(K_left_safe, rng$K_max),
+    breaks = breaksK,
+    minor_breaks = NULL,
+    labels = scales::label_comma(),
+    expand = ggplot2::expansion(mult = c(0, 0))
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2),
+    expand = ggplot2::expansion(mult = c(0, 0.01))
+  ) +
+  ggplot2::scale_color_viridis_c(
+    limits = leg$limits,
+    breaks = leg$breaks,
+    labels = leg$labels,
+    name   = "Body mass",
+    guide  = ggplot2::guide_colorbar(
+      direction      = "vertical",
+      barheight      = grid::unit(46, "mm"),
+      barwidth       = grid::unit(5,  "mm"),
+      ticks          = TRUE,
+      title.position = "top",
+      title.hjust    = 0.5,
+      label.position = "right"
+    )
+  ) +
+  ggplot2::labs(
+    x = "Starting population K",
+    y = "Persistence probability"
+  ) +
+  theme_pub(base_size = 12) +
+  ggplot2::theme(
+    panel.grid.major.y = ggplot2::element_line(color = "grey92", linewidth = 0.3),
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.minor   = ggplot2::element_blank(),
+
+    legend.position      = c(0.98, 0.055),
+    legend.justification = c(1, 0),
+    legend.direction     = "vertical",
+    legend.box.margin    = ggplot2::margin(2, 2, 8, 2),
+    legend.margin        = ggplot2::margin(6, 6, 12, 6),
+    legend.background    = ggplot2::element_rect(
+      fill      = scales::alpha("white", 0.88),
+      color     = "grey70",
+      linewidth = 0.3
+    ),
+    legend.title = ggplot2::element_text(face = "bold", size = 10),
+    legend.text  = ggplot2::element_text(size = 9)
+  )
+
+# Print in the knitted document (no saving)
+fig_S2_all_mammals
+```
+
+```{r}
+## ---- SI_Fig_S3_loess_params_alpha_beta_two_versions --------------------------
+## SI Fig S3 (printed only; NO files written):
+## LOESS-derived parameter curves (alpha, beta) for Mammals.
+## Produces TWO versions:
+##   (A) Median persistence only (q50)
+##   (B) Median + lower-tail persistence (q50, q16, q025)
+
+# ---------------------------- config ------------------------------------------
+CURVE_MAIN <- "q50"
+CURVES_SENS <- c("q16", "q025")
+CURVES_ALL  <- c(CURVE_MAIN, CURVES_SENS)
+
+CURVE_LABS <- c(q50 = "Median", q16 = "Lower tail (P16)", q025 = "Lower tail (P2.5)")
+CURVE_COLS <- c(q50 = "#0072B2", q16 = "grey40", q025 = "grey40")
+CURVE_LTY  <- c(q50 = "solid",   q16 = "longdash", q025 = "dotted")
+
+# ---------------------------- data (points + LOESS preds) ---------------------
+pm_pts_all <- params |>
+  dplyr::filter(group == "Mammals", fit_ok, curve %in% CURVES_ALL) |>
+  dplyr::transmute(
+    mass_g = as.numeric(mass_g),
+    curve  = factor(as.character(curve), levels = CURVES_ALL),
+    alpha  = as.numeric(alpha),
+    beta   = as.numeric(beta)
+  ) |>
+  dplyr::filter(is.finite(mass_g), mass_g > 0)
+
+# Long table built from the already-computed loess_pred grid:
+# columns: mass_g, mid/lo/hi, curve, param ("alpha"/"beta")
+pred_src <- loess_pred |>
+  dplyr::filter(group == "Mammals", curve %in% CURVES_ALL) |>
+  dplyr::transmute(
+    mass_g    = as.numeric(mass_g),
+    curve     = factor(as.character(curve), levels = CURVES_ALL),
+    alpha_mid = as.numeric(alpha_mid),
+    alpha_lo  = as.numeric(alpha_lo),
+    alpha_hi  = as.numeric(alpha_hi),
+    beta_mid  = as.numeric(beta_mid),
+    beta_lo   = as.numeric(beta_lo),
+    beta_hi   = as.numeric(beta_hi)
+  )
+
+loess_pred_all <- dplyr::bind_rows(
+  pred_src |>
+    dplyr::transmute(mass_g, curve, mid = alpha_mid, lo = alpha_lo, hi = alpha_hi, param = "alpha"),
+  pred_src |>
+    dplyr::transmute(mass_g, curve, mid = beta_mid,  lo = beta_lo,  hi = beta_hi,  param = "beta")
+)
+
+# ---------------------------- plot helper ------------------------------------
+plot_loess_param <- function(param = c("alpha", "beta"),
+                             curves_to_plot,
+                             show_x = TRUE,
+                             show_y = TRUE,
+                             show_legend = FALSE) {
+  param <- match.arg(param)
+  curves_to_plot <- intersect(CURVES_ALL, curves_to_plot)
+
+  pred <- loess_pred_all |>
+    dplyr::filter(param == !!param, curve %in% curves_to_plot)
+
+  pts <- pm_pts_all |>
+    dplyr::filter(curve %in% curves_to_plot)
+
+  # Separate main curve for visual emphasis
+  pred_main <- pred |> dplyr::filter(curve == CURVE_MAIN)
+  pred_sens <- pred |> dplyr::filter(curve != CURVE_MAIN)
+  pts_main  <- pts  |> dplyr::filter(curve == CURVE_MAIN)
+  pts_sens  <- pts  |> dplyr::filter(curve != CURVE_MAIN)
+
+  p <- ggplot2::ggplot() +
+    # CI ribbon for the main curve only
+    ggplot2::geom_ribbon(
+      data = pred_main,
+      ggplot2::aes(x = mass_g, ymin = lo, ymax = hi),
+      fill = CURVE_COLS[[CURVE_MAIN]],
+      alpha = 0.14,
+      colour = NA
+    ) +
+    # Points (behind lines)
+    ggplot2::geom_point(
+      data = pts_sens,
+      ggplot2::aes(x = mass_g, y = .data[[param]], color = curve),
+      shape = 16, size = 1.6, alpha = 0.75,
+      show.legend = FALSE
+    ) +
+    ggplot2::geom_point(
+      data = pts_main,
+      ggplot2::aes(x = mass_g, y = .data[[param]], color = curve),
+      shape = 16, size = 2.0, alpha = 0.90,
+      show.legend = FALSE
+    ) +
+    # Lines (on top)
+    ggplot2::geom_line(
+      data = pred_sens,
+      ggplot2::aes(x = mass_g, y = mid, color = curve, linetype = curve),
+      linewidth = 0.85, alpha = 0.80, lineend = "round"
+    ) +
+    ggplot2::geom_line(
+      data = pred_main,
+      ggplot2::aes(x = mass_g, y = mid, color = curve, linetype = curve),
+      linewidth = 1.20, alpha = 1.00, lineend = "round"
+    ) +
+    # Scales + labels
+    ggplot2::scale_x_log10(
+      breaks = scales::log_breaks(n = 4),
+      labels = fmt_mass_axis,
+      expand = ggplot2::expansion(mult = c(0.02, 0.03))
+    ) +
+    ggplot2::scale_color_manual(
+      values = CURVE_COLS,
+      breaks = curves_to_plot,
+      labels = CURVE_LABS[curves_to_plot],
+      name   = NULL
+    ) +
+    ggplot2::scale_linetype_manual(
+      values = CURVE_LTY,
+      breaks = curves_to_plot,
+      labels = CURVE_LABS[curves_to_plot],
+      name   = NULL
+    ) +
+    ggplot2::guides(
+      color = ggplot2::guide_legend(nrow = 1, byrow = TRUE, override.aes = list(shape = NA))
+    ) +
+    ggplot2::labs(
+      x = if (isTRUE(show_x)) "Body mass" else NULL,
+      y = if (isTRUE(show_y)) if (param == "alpha") expression(alpha) else expression(beta) else NULL
+    ) +
+    theme_pub(base_size = 12) +
+    ggplot2::theme(
+      panel.grid.major = ggplot2::element_blank(),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position  = if (isTRUE(show_legend)) "bottom" else "none",
+      legend.text      = ggplot2::element_text(size = 10, color = "grey15"),
+      legend.key.width = grid::unit(1.05, "lines"),
+      legend.spacing.x = grid::unit(0.35, "lines")
+    )
+
+  # Parameter-specific y-scale
+  if (param == "alpha") {
+    p + ggplot2::scale_y_log10(
+      breaks = scales::log_breaks(n = 4),
+      labels = scales::label_number(),
+      expand = ggplot2::expansion(mult = c(0.02, 0.05))
+    )
+  } else {
+    p + ggplot2::scale_y_continuous(
+      breaks = scales::pretty_breaks(n = 5),
+      labels = scales::label_number(),
+      expand = ggplot2::expansion(mult = c(0.02, 0.05))
+    )
+  }
+}
+
+# =============================================================================
+# VERSION A: Median only
+# =============================================================================
+pA_alpha <- plot_loess_param("alpha", CURVE_MAIN, show_legend = FALSE)
+pA_beta  <- plot_loess_param("beta",  CURVE_MAIN, show_legend = FALSE)
+
+fig_S3_loess_q50 <- cowplot::plot_grid(
+  pA_alpha, pA_beta,
+  nrow = 1,
+  labels = c("(a)", "(b)"),
+  label_fontface = "bold",
+  label_size = 13,
+  align = "hv",
+  axis  = "tb"
+)
+
+# =============================================================================
+# VERSION B: Median + lower-tail (legend extracted once)
+# =============================================================================
+pB_alpha <- plot_loess_param("alpha", CURVES_ALL, show_legend = FALSE)
+
+pB_beta_leg <- plot_loess_param("beta", CURVES_ALL, show_legend = TRUE)
+legend_B <- cowplot::get_legend(pB_beta_leg)
+pB_beta  <- pB_beta_leg + ggplot2::theme(legend.position = "none")
+
+row_B <- cowplot::plot_grid(
+  pB_alpha, pB_beta,
+  nrow = 1,
+  labels = c("(a)", "(b)"),
+  label_fontface = "bold",
+  label_size = 13,
+  align = "hv",
+  axis  = "tb"
+)
+
+fig_S3_loess_q50_q16_q025 <- cowplot::plot_grid(
+  row_B, legend_B,
+  ncol = 1,
+  rel_heights = c(1, 0.16)
+)
+
+# Print both in the knitted document (no saving)
+fig_S3_loess_q50
+fig_S3_loess_q50_q16_q025
+```
+
+```{r}
+## ---- SI_Fig_S2_all_mammals_log10K_heatmap_LOESS_with_mass_labels_inset_legend ----
+## SI Fig S2 (variant; printed only; NO files written):
+## Heatmap in (K, p) space where fill encodes body mass (log10(mass_g)).
+## - Envelope comes from the 31 per-mass Gompertz fits (params).
+## - Fill comes from LOESS-smoothed (alpha_mid, beta_mid) curves (loess_pred).
+
+curve_use <- "q50"  # choose from CURVES
+
+# ---------------------------- data prep ---------------------------------------
+# Shared K range for mammals at this curve
+rng         <- mammal_K_range(curves, curve_use)
+K_left_safe <- safe_K_left(rng$K_min, K0)
+K_max       <- rng$K_max
+
+# Per-mass fitted Gompertz parameters (for envelope only)
+pm <- params |>
+  dplyr::filter(group == "Mammals", curve == curve_use, fit_ok) |>
+  dplyr::transmute(
+    mass_idx = as.integer(mass_idx),
+    mass_g   = as.numeric(mass_g),
+    alpha    = as.numeric(alpha),
+    beta     = as.numeric(beta)
+  ) |>
+  dplyr::arrange(mass_idx)
+
+# LOESS-smoothed parameters (for fill only)
+pm_loess <- loess_pred |>
+  dplyr::filter(group == "Mammals", curve == curve_use) |>
+  dplyr::transmute(
+    logM  = log10(as.numeric(mass_g)),
+    alpha = as.numeric(alpha_mid),
+    beta  = as.numeric(beta_mid)
+  ) |>
+  dplyr::filter(is.finite(logM), is.finite(alpha), alpha > 0, is.finite(beta), beta > 0)
+
+# ---------------------------- heatmap grid ------------------------------------
+nx <- 600  # columns in log10(K)
+ny <- 400  # rows in p
+
+logK_edges <- seq(log10(K_left_safe), log10(K_max), length.out = nx + 1)
+p_edges    <- seq(0, 1, length.out = ny + 1)
+
+logK_mid <- (logK_edges[-1] + logK_edges[-length(logK_edges)]) / 2
+K_mid    <- 10^logK_mid
+p_mid    <- (p_edges[-1] + p_edges[-length(p_edges)]) / 2
+
+# Rectangle geometry (works correctly under log10 x-scale)
+xmin <- 10^logK_edges[-(nx + 1)]
+xmax <- 10^logK_edges[-1]
+ymin <- p_edges[-(ny + 1)]
+ymax <- p_edges[-1]
+
+# ---------------------------- envelope (bounds per K column) ------------------
+# Evaluate all fitted curves at the heatmap K columns, then take min/max p per K.
+env <- build_fitted_curves(pm, K_mid, K0) |>
+  dplyr::group_by(K) |>
+  dplyr::summarise(
+    p_lo = min(p, na.rm = TRUE),
+    p_hi = max(p, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(K)
+
+# Align envelope vectors to K_mid deterministically
+idx <- match(K_mid, env$K)
+p_lo_vec <- env$p_lo[idx]
+p_hi_vec <- env$p_hi[idx]
+
+# ---------------------------- fill each K column ------------------------------
+fill_one_col <- function(i) {
+  # Envelope bounds at this K
+  p_lo <- p_lo_vec[i]
+  p_hi <- p_hi_vec[i]
+  if (!is.finite(p_lo) || !is.finite(p_hi) || p_hi <= p_lo) return(NULL)
+
+  # Persistence across (LOESS) masses at this K
+  p_mass <- predict_p(pm_loess$alpha, pm_loess$beta, K_mid[i], K0 = K0)
+  ok <- is.finite(p_mass) & p_mass >= 0 & p_mass <= 1 & is.finite(pm_loess$logM)
+  if (!any(ok)) return(NULL)
+
+  # Invert p -> logM by monotone interpolation (drop duplicate p)
+  ord <- order(p_mass[ok])
+  p_sorted <- p_mass[ok][ord]
+  m_sorted <- pm_loess$logM[ok][ord]
+
+  keep <- !duplicated(p_sorted)
+  p_sorted <- p_sorted[keep]
+  m_sorted <- m_sorted[keep]
+  if (length(p_sorted) < 2) return(NULL)
+
+  # Only fill p values that lie inside both the envelope and the LOESS-supported range
+  p_low  <- max(p_lo, min(p_sorted, na.rm = TRUE))
+  p_high <- min(p_hi, max(p_sorted, na.rm = TRUE))
+  if (!is.finite(p_low) || !is.finite(p_high) || p_high <= p_low) return(NULL)
+
+  j <- which(p_mid >= p_low & p_mid <= p_high)
+  if (length(j) == 0) return(NULL)
+
+  fill_j <- stats::approx(p_sorted, m_sorted, xout = p_mid[j], rule = 2)$y
+
+  tibble::tibble(
+    xmin = xmin[i], xmax = xmax[i],
+    ymin = ymin[j], ymax = ymax[j],
+    fill_logM = fill_j
+  )
+}
+
+heat_plot <- dplyr::bind_rows(lapply(seq_len(nx), fill_one_col)) |>
+  dplyr::filter(is.finite(fill_logM))
+
+# ---------------------------- axes + legend -----------------------------------
+breaksK <- tick_K(K_max, K_left_safe)
+
+leg <- mass_legend_breaks(
+  pm     = pm,
+  idx    = c(1L, 16L, 31L),
+  labels = c("2 g", "3.1 kg", "4,750 kg")
+)
+
+# Include LOESS fill range to avoid "all NA" from overly strict limits
+logM_limits <- range(c(leg$limits, pm_loess$logM), na.rm = TRUE)
+
+# ---------------------------- plot (print only) -------------------------------
+fig_S2_all_mammals_heatmap <- ggplot2::ggplot(
+  heat_plot,
+  ggplot2::aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill_logM)
+) +
+  ggplot2::geom_rect(color = NA, na.rm = TRUE) +
+  ggplot2::coord_cartesian(ylim = c(0, 1), clip = "off") +
+  ggplot2::scale_x_log10(
+    limits = c(K_left_safe, K_max),
+    breaks = breaksK,
+    minor_breaks = NULL,
+    labels = scales::label_comma(),
+    expand = ggplot2::expansion(mult = c(0, 0))
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2),
+    expand = ggplot2::expansion(mult = c(0, 0.01))
+  ) +
+  ggplot2::scale_fill_viridis_c(
+    limits = logM_limits,
+    breaks = leg$breaks,
+    labels = leg$labels,
+    oob    = scales::squish,
+    name   = "Body mass",
+    guide  = ggplot2::guide_colorbar(
+      direction      = "vertical",
+      barheight      = grid::unit(46, "mm"),
+      barwidth       = grid::unit(5,  "mm"),
+      ticks          = TRUE,
+      title.position = "top",
+      title.hjust    = 0.5,
+      label.position = "right"
+    )
+  ) +
+  ggplot2::labs(
+    x = "Starting population K",
+    y = "Persistence probability"
+  ) +
+  theme_pub(base_size = 12) +
+  ggplot2::theme(
+    panel.grid.major.y = ggplot2::element_line(color = "grey92", linewidth = 0.3),
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.minor   = ggplot2::element_blank(),
+
+    legend.position      = c(0.98, 0.055),
+    legend.justification = c(1, 0),
+    legend.direction     = "vertical",
+    legend.box.margin    = ggplot2::margin(2, 2, 8, 2),
+    legend.margin        = ggplot2::margin(6, 6, 12, 6),
+    legend.background    = ggplot2::element_rect(
+      fill      = scales::alpha("white", 0.88),
+      color     = "grey70",
+      linewidth = 0.3
+    ),
+    legend.title = ggplot2::element_text(face = "bold", size = 10),
+    legend.text  = ggplot2::element_text(size = 9)
+  )
+
+fig_S2_all_mammals_heatmap
+```
+
+```{r}
+## ---- SI_Fig_Birds_LOESS_alpha_beta_2x3_all_combos ----------------------------
+## 2x3 figure:
+##   Row 1 = alpha (log10 y)
+##   Row 2 = beta  (linear y)
+##   Cols  = q50, q16, q025
+## Each panel shows ALL bird diet combos as colored LOESS lines. No legend.
+
+CURVES_BIRDS <- c("q50", "q16", "q025")
+
+curve_title <- c(
+  q50  = "q50 (median)",
+  q16  = "q16 (P16)",
+  q025 = "q025 (P2.5)"
+)
+
+# Stable combo order (colors stay consistent across all panels)
+combo_levels <- loess_pred |>
+  dplyr::filter(group == "Birds") |>
+  dplyr::pull(combo) |>
+  unique() |>
+  sort()
+
+# Wide table once (avoid magrittr '.'; works with base '|>')
+pred_wide <- loess_pred |>
+  dplyr::filter(group == "Birds", curve %in% CURVES_BIRDS) |>
+  dplyr::transmute(
+    combo  = factor(as.character(combo), levels = combo_levels),
+    curve  = factor(as.character(curve), levels = CURVES_BIRDS),
+    mass_g = as.numeric(mass_g),
+    alpha  = as.numeric(alpha_mid),
+    beta   = as.numeric(beta_mid)
+  ) |>
+  dplyr::filter(is.finite(mass_g), mass_g > 0)
+
+# Discrete palette (22 combos)
+pal <- viridisLite::viridis(length(combo_levels), option = "D", end = 0.95)
+names(pal) <- combo_levels
+
+make_row_plot <- function(param = c("alpha", "beta"), show_x = TRUE) {
+  param <- match.arg(param)
+
+  df <- pred_wide |>
+    dplyr::transmute(
+      combo, curve, mass_g,
+      y = if (param == "alpha") alpha else beta
+    ) |>
+    dplyr::filter(is.finite(y), y > 0)
+
+  p <- ggplot2::ggplot(
+    df,
+    ggplot2::aes(x = mass_g, y = y, group = combo, color = combo)
+  ) +
+    ggplot2::geom_line(linewidth = 0.9, alpha = 0.92, lineend = "round", na.rm = TRUE) +
+    ggplot2::facet_wrap(
+      ~ curve, nrow = 1,
+      labeller = ggplot2::as_labeller(curve_title)
+    ) +
+    ggplot2::scale_x_log10(
+      breaks = scales::log_breaks(n = 4),
+      labels = fmt_mass_axis,
+      expand = ggplot2::expansion(mult = c(0.02, 0.04))
+    ) +
+    ggplot2::scale_color_manual(values = pal, guide = "none") +
+    theme_pub(base_size = 12) +
+    ggplot2::theme(
+      panel.grid.major = ggplot2::element_blank(),
+      panel.grid.minor = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold", size = 11)
+    ) +
+    ggplot2::labs(
+      x = if (isTRUE(show_x)) "Body mass" else NULL,
+      y = if (param == "alpha") expression(alpha) else expression(beta)
+    )
+
+  if (param == "alpha") {
+    p + ggplot2::scale_y_log10(
+      breaks = scales::log_breaks(n = 4),
+      labels = scales::label_number(),
+      expand = ggplot2::expansion(mult = c(0.02, 0.06))
+    )
+  } else {
+    p + ggplot2::scale_y_continuous(
+      breaks = scales::pretty_breaks(n = 5),
+      labels = scales::label_number(),
+      expand = ggplot2::expansion(mult = c(0.02, 0.06))
+    )
+  }
+}
+
+p_alpha <- make_row_plot("alpha", show_x = FALSE) +
+  ggplot2::theme(axis.title.x = ggplot2::element_blank())
+
+p_beta  <- make_row_plot("beta",  show_x = TRUE)
+
+fig_birds_loess_2x3 <- cowplot::plot_grid(
+  p_alpha, p_beta,
+  ncol = 1,
+  align = "hv",
+  axis = "tblr",
+  rel_heights = c(1, 1)
+)
+
+fig_birds_loess_2x3
+```
+
+```{r}
+## ---- birds_combo_palette_match_ternary_sigma_and_plot_2x3 --------------------
+## Goal: color each diet combo line by the SAME σ_r value implied by the ternary σ diagram.
+## Implementation: compute predicted log10(σ_r) at the ternary reference mass (108 g),
+## then map those values through the SAME "plasma" gradient used in Fig 2(b),
+## and reuse those colors for the LOESS Gompertz parameter curves.
+
+CURVES_BIRDS <- c("q50", "q16", "q025")
+REF_MASS_G   <- 108  # must match Figure 2(b): mass_for_map_g
+
+# Files produced by 1_rm_sigma_models.Rmd (your script above)
+PATH_ILR_COMBOS <- "Data/Clean/bird_ilr_combo_coords.csv"
+PATH_POST_SIGMA <- "Data/Clean/post_bird_sigma_ilr_coefs.csv"
+
+# ---- 1) Build a combo -> predicted log10(sigma_r) table -----------------------
+
+# (a) ILR coordinates for the 22 diet combos (combo, ilr1, ilr2)
+ilr_design <- readr::read_csv(PATH_ILR_COMBOS, show_col_types = FALSE) |>
+  dplyr::transmute(
+    combo = as.character(combo),
+    ilr1  = as.numeric(ilr1),
+    ilr2  = as.numeric(ilr2)
+  )
+
+# (b) Use posterior medians for the bird σ_r ~ logM + ilr1 + ilr2 model
+#     (this is the diet-structured σ_r model you fit in JAGS)
+draws_sigma <- readr::read_csv(
+  PATH_POST_SIGMA,
+  show_col_types = FALSE,
+  col_select = dplyr::all_of(c("alpha", "beta_logM", "beta_ilr1", "beta_ilr2"))
+)
+
+coef_med <- list(
+  alpha     = stats::median(draws_sigma$alpha,     na.rm = TRUE),
+  beta_logM = stats::median(draws_sigma$beta_logM, na.rm = TRUE),
+  beta_ilr1 = stats::median(draws_sigma$beta_ilr1, na.rm = TRUE),
+  beta_ilr2 = stats::median(draws_sigma$beta_ilr2, na.rm = TRUE)
+)
+
+combo_sigma <- ilr_design |>
+  dplyr::mutate(
+    logM = log10(REF_MASS_G),
+    pred_logSigma = coef_med$alpha +
+      coef_med$beta_logM * logM +
+      coef_med$beta_ilr1 * ilr1 +
+      coef_med$beta_ilr2 * ilr2
+  )
+
+# ---- 2) Match Fig 2(b) ternary *color mapping* (plasma; domain over 10% simplex grid)
+
+# Minimal copies of the ternary helpers (no checks; same logic as 1_rm_sigma_models.Rmd)
+zero_replace <- function(prop_df) {
+  zCompositions::cmultRepl(as.data.frame(prop_df), method = "CZM", label = 0) |>
+    as.data.frame()
+}
+to_ilr3 <- function(prop_df) {
+  X <- as.data.frame(prop_df)
+  X <- X / rowSums(X)
+  X <- zero_replace(X)
+  X <- X / rowSums(X)
+  Z <- compositions::ilr(compositions::acomp(X)) |>
+    as.data.frame()
+  names(Z) <- c("ilr1", "ilr2")
+  Z
+}
+simplex_grid_10pct <- function() {
+  k <- 10
+  g <- expand.grid(i = 0:k, j = 0:k)
+  g$k <- k - g$i - g$j
+  g <- g[g$k >= 0, , drop = FALSE]
+  tibble::tibble(
+    Diet_Inv          = g$i / k,
+    Diet_AllPlants    = g$j / k,
+    Diet_VertFishScav = g$k / k
+  )
+}
+
+grid_prop <- simplex_grid_10pct()
+grid_ilr  <- to_ilr3(grid_prop)
+
+grid_pred <- dplyr::bind_cols(grid_prop, grid_ilr) |>
+  dplyr::mutate(
+    logM = log10(REF_MASS_G),
+    pred_logSigma = coef_med$alpha +
+      coef_med$beta_logM * logM +
+      coef_med$beta_ilr1 * ilr1 +
+      coef_med$beta_ilr2 * ilr2
+  )
+
+sigma_domain <- range(grid_pred$pred_logSigma, finite = TRUE)
+
+# Same palette family as Fig 2(b): option = "plasma", end = 0.98
+col_fun <- scales::col_numeric(
+  palette = viridisLite::plasma(256, end = 0.98),
+  domain  = sigma_domain
+)
+
+pal_combo_sigma <- stats::setNames(col_fun(combo_sigma$pred_logSigma), combo_sigma$combo)
+
+# If any combo appears in loess_pred but not in pal_combo_sigma, make it grey
+combo_levels <- loess_pred |>
+  dplyr::filter(group == "Birds") |>
+  dplyr::pull(combo) |>
+  unique() |>
+  sort()
+
+missing_cols <- setdiff(combo_levels, names(pal_combo_sigma))
+if (length(missing_cols) > 0) {
+  pal_combo_sigma <- c(pal_combo_sigma, stats::setNames(rep("grey70", length(missing_cols)), missing_cols))
+}
+
+# ---- 3) Your 2x3 LOESS Gompertz parameter figure, using the sigma-matched colors ----
+
+curve_title <- c(q50 = "q50 (median)", q16 = "q16 (P16)", q025 = "q025 (P2.5)")
+
+pred_wide <- loess_pred |>
+  dplyr::filter(group == "Birds", curve %in% CURVES_BIRDS) |>
+  dplyr::transmute(
+    combo  = factor(as.character(combo), levels = combo_levels),
+    curve  = factor(as.character(curve), levels = CURVES_BIRDS),
+    mass_g = as.numeric(mass_g),
+    alpha  = as.numeric(alpha_mid),
+    beta   = as.numeric(beta_mid)
+  ) |>
+  dplyr::filter(is.finite(mass_g), mass_g > 0)
+
+make_row_plot <- function(param = c("alpha", "beta"), show_x = TRUE) {
+  param <- match.arg(param)
+
+  df <- pred_wide |>
+    dplyr::transmute(
+      combo, curve, mass_g,
+      y = if (param == "alpha") alpha else beta
+    ) |>
+    dplyr::filter(is.finite(y), y > 0)
+
+  p <- ggplot2::ggplot(
+    df,
+    ggplot2::aes(x = mass_g, y = y, group = combo, color = combo)
+  ) +
+    ggplot2::geom_line(linewidth = 0.9, alpha = 0.92, lineend = "round", na.rm = TRUE) +
+    ggplot2::facet_wrap(
+      ~ curve, nrow = 1,
+      labeller = ggplot2::as_labeller(curve_title)
+    ) +
+    ggplot2::scale_x_log10(
+      breaks = scales::log_breaks(n = 4),
+      labels = fmt_mass_axis,
+      expand = ggplot2::expansion(mult = c(0.02, 0.04))
+    ) +
+    ggplot2::scale_color_manual(values = pal_combo_sigma, guide = "none") +
+    theme_pub(base_size = 12) +
+    ggplot2::theme(
+      panel.grid.major = ggplot2::element_blank(),
+      panel.grid.minor = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold", size = 11)
+    ) +
+    ggplot2::labs(
+      x = if (isTRUE(show_x)) "Body mass" else NULL,
+      y = if (param == "alpha") expression(alpha) else expression(beta)
+    )
+
+  if (param == "alpha") {
+    p + ggplot2::scale_y_log10(
+      breaks = scales::log_breaks(n = 4),
+      labels = scales::label_number(),
+      expand = ggplot2::expansion(mult = c(0.02, 0.06))
+    )
+  } else {
+    p + ggplot2::scale_y_continuous(
+      breaks = scales::pretty_breaks(n = 5),
+      labels = scales::label_number(),
+      expand = ggplot2::expansion(mult = c(0.02, 0.06))
+    )
+  }
+}
+
+p_alpha <- make_row_plot("alpha", show_x = FALSE) +
+  ggplot2::theme(axis.title.x = ggplot2::element_blank())
+
+p_beta  <- make_row_plot("beta", show_x = TRUE)
+
+fig_birds_loess_2x3_sigma_colors <- cowplot::plot_grid(
+  p_alpha, p_beta,
+  ncol = 1,
+  align = "hv",
+  axis  = "tblr",
+  rel_heights = c(1, 1)
+)
+
+fig_birds_loess_2x3_sigma_colors
+```
+
+```{r}
+## ---- birds_ternary_sigma_reference_plot_from_posteriors ----------------------
+## Works WITHOUT bird_sigma_data.
+## Uses posterior medians (diet-structured σr model) and the same plasma palette
+## as Fig 2(b), with domain set by the 10% simplex grid.
+##
+## Updates in this version:
+##  - Remove axis tick labels (and ticks) using ggtern convenience themes
+##    (avoids theme-element warnings across ggtern versions)
+##  - Legend on the right, vertical
+##  - Remove plane grid entirely
+##  - Prevent edge clipping using theme_nomask() + clip="off" when supported
+##  - Grey background points are not colored; only the 22 combos are colored
+
+REF_MASS_G <- 108
+
+PATH_POST_SIGMA  <- "Data/Clean/post_bird_sigma_ilr_coefs.csv"
+PATH_ILR_COMBOS  <- "Data/Clean/bird_ilr_combo_coords.csv"  # optional overlay
+SHOW_COMBO_PTS   <- TRUE
+COMBO_PT_SIZE    <- 2.3
+GRID_PT_SIZE     <- 2.2
+
+# --- helpers (no checks) ------------------------------------------------------
+zero_replace <- function(prop_df) {
+  out <- NULL
+  invisible(capture.output({
+    out <- zCompositions::cmultRepl(as.data.frame(prop_df), method = "CZM", label = 0)
+  }))
+  as.data.frame(out)
+}
+
+to_ilr3 <- function(prop_df) {
+  X <- as.data.frame(prop_df)
+  X <- X / rowSums(X)
+  X <- zero_replace(X)
+  X <- X / rowSums(X)
+  Z <- compositions::ilr(compositions::acomp(X)) |> as.data.frame()
+  names(Z) <- c("ilr1", "ilr2")
+  Z
+}
+
+simplex_grid_10pct <- function() {
+  k <- 10
+  g <- expand.grid(i = 0:k, j = 0:k)
+  g$k <- k - g$i - g$j
+  g <- g[g$k >= 0, , drop = FALSE]
+  tibble::tibble(
+    Diet_Inv          = g$i / k,
+    Diet_AllPlants    = g$j / k,
+    Diet_VertFishScav = g$k / k
+  )
+}
+
+# Safely add ggtern convenience themes even if a function is missing (older ggtern)
+tern_theme_if_exists <- function(fname) {
+  ns <- asNamespace("ggtern")
+  if (exists(fname, envir = ns, inherits = FALSE)) {
+    get(fname, envir = ns)()
+  } else {
+    ggplot2::theme()
+  }
+}
+
+# Turn off panel clipping if this ggtern coord supports it (no new coord added)
+set_clip_off_if_supported <- function(p) {
+  tryCatch({
+    p$coordinates$clip <- "off"
+    p
+  }, error = function(e) p)
+}
+
+# --- 1) posterior medians -----------------------------------------------------
+draws_sigma <- readr::read_csv(
+  PATH_POST_SIGMA,
+  show_col_types = FALSE,
+  col_select = dplyr::all_of(c("alpha", "beta_logM", "beta_ilr1", "beta_ilr2"))
+)
+
+coef_med <- list(
+  alpha     = stats::median(draws_sigma$alpha,     na.rm = TRUE),
+  beta_logM = stats::median(draws_sigma$beta_logM, na.rm = TRUE),
+  beta_ilr1 = stats::median(draws_sigma$beta_ilr1, na.rm = TRUE),
+  beta_ilr2 = stats::median(draws_sigma$beta_ilr2, na.rm = TRUE)
+)
+
+# --- 2) simplex grid + predictions (domain for plasma scale) ------------------
+grid_prop <- simplex_grid_10pct()
+grid_ilr  <- to_ilr3(grid_prop)
+
+grid_plot <- dplyr::bind_cols(grid_prop, grid_ilr) |>
+  dplyr::mutate(
+    logM = log10(REF_MASS_G),
+    pred_logSigma = coef_med$alpha +
+      coef_med$beta_logM * logM +
+      coef_med$beta_ilr1 * ilr1 +
+      coef_med$beta_ilr2 * ilr2
+  )
+
+sigma_domain <- range(grid_plot$pred_logSigma, finite = TRUE)
+
+# --- 3) base ternary: grey background points; NO plane grid -------------------
+p_tern_ref <- ggtern::ggtern(
+  grid_plot,
+  ggplot2::aes(
+    x = Diet_AllPlants,
+    y = Diet_VertFishScav,
+    z = Diet_Inv
+  )
+) +
+  ggplot2::geom_point(
+    shape  = 16,
+    size   = GRID_PT_SIZE,
+    colour = "grey85"
+  ) +
+  # keep fill scale for combo overlay + legend
+  ggplot2::scale_fill_viridis_c(option = "plasma", end = 0.98, limits = sigma_domain) +
+  ggplot2::labs(
+    x = NULL, y = NULL, z = NULL,
+    L = "Plants", R = "Vertebrates", T = "Invertebrates",
+    fill = expression(log[10] * "(σ"[r] * ")")
+  ) +
+  suppressWarnings(theme_pub(base_size = 11)) +
+  # remove plane grid, remove tick labels + ticks, and remove the clipping mask
+  tern_theme_if_exists("theme_nogrid") +
+  tern_theme_if_exists("theme_nolabels") +
+  tern_theme_if_exists("theme_noticks") +
+  tern_theme_if_exists("theme_nomask") +
+  ggplot2::theme(
+    legend.position  = "right",
+    legend.direction = "vertical",
+    # extra space on the right for the vertical legend
+    plot.margin      = ggplot2::margin(50, 160, 50, 110)
+  ) +
+  ggplot2::guides(
+    fill = ggplot2::guide_colorbar(
+      title.position = "top",
+      title.hjust    = 0.5,
+      direction      = "vertical"
+    )
+  )
+
+# --- 4) overlay ONLY the 22 combos as colored points --------------------------
+if (isTRUE(SHOW_COMBO_PTS) && file.exists(PATH_ILR_COMBOS)) {
+
+  combo_prop <- readr::read_csv(PATH_ILR_COMBOS, show_col_types = FALSE) |>
+    dplyr::transmute(
+      combo = as.character(combo),
+      Diet_Inv          = as.numeric(sub("^([0-9]+)_.*$", "\\1", combo)) / 100,
+      Diet_AllPlants    = as.numeric(sub("^[0-9]+_([0-9]+)_.*$", "\\1", combo)) / 100,
+      Diet_VertFishScav = as.numeric(sub("^[0-9]+_[0-9]+_([0-9]+)$", "\\1", combo)) / 100
+    ) |>
+    dplyr::filter(
+      is.finite(Diet_Inv), is.finite(Diet_AllPlants), is.finite(Diet_VertFishScav),
+      dplyr::near(Diet_Inv + Diet_AllPlants + Diet_VertFishScav, 1, tol = 1e-6)
+    )
+
+  combo_ilr <- to_ilr3(combo_prop[, c("Diet_Inv","Diet_AllPlants","Diet_VertFishScav")])
+
+  combo_plot <- dplyr::bind_cols(combo_prop, combo_ilr) |>
+    dplyr::mutate(
+      logM = log10(REF_MASS_G),
+      pred_logSigma = coef_med$alpha +
+        coef_med$beta_logM * logM +
+        coef_med$beta_ilr1 * ilr1 +
+        coef_med$beta_ilr2 * ilr2
+    )
+
+  p_tern_ref <- p_tern_ref +
+    ggplot2::geom_point(
+      data = combo_plot,
+      ggplot2::aes(fill = pred_logSigma),
+      shape  = 21,
+      size   = COMBO_PT_SIZE,
+      stroke = 0.45,
+      colour = "grey10"
+    )
+}
+
+# also disable panel clipping if supported (helps if theme_nomask isn't available)
+p_tern_ref <- set_clip_off_if_supported(p_tern_ref)
+
+p_tern_ref
+```
