@@ -1,0 +1,325 @@
+
+
+---
+title: "9_rank_int_masks"   # shorter: builds rankmap-based intermediate masks (rank_int)
+output: html_document
+params:
+  # ---- curve selector ----
+  curve: "q025"   # one of: "q50", "q16", "q025"
+
+  # ---- species filter (filters species list only; never affects folder names) ----
+  do_mammals: true
+  do_birds: true
+  species_csv: "Data/Clean/species_table.csv"
+
+  # ---- inputs ----
+  patch_dir: "Data/Clean/Patches_binary"              # per-species binary patch rasters
+  init_path: "Spatial/global_orchestrator_init.rds"   # provides template grid (patch_stack_file)
+
+  # ---- analysis contract roots ----
+  ana_subdir: "ana"           # under Spatial/Outputs_<curve>/
+  rank_alive_dir: "rank_alive" # ana/rank_alive/ (from Script 8)
+  rank_alive_prefix: "alive_stage_"  # alive_stage_0001.tif, ...
+
+  # ---- outputs ----
+  int_dir: "rank_int"         # ana/rank_int/stage_0001/<species>.tif
+
+  # ---- stage selection ----
+  restrict_stages: ""         # e.g. "1:20" or "" for all stages found in rank_alive_dir
+
+  # ---- run controls ----
+  build: true                 # set true to (re)write intermediates
+  overwrite: false
+  auto_align: true            # if TRUE, resample/project to template if needed
+---
+
+```{r}
+# ============================================================
+# 00_checks — ALL setup + preconditions + helpers
+# After this chunk, the rest of the script is "do the work".
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(terra)
+  library(data.table)
+})
+
+# -------------------------
+# tiny helpers
+# -------------------------
+assert <- function(ok, msg) if (!isTRUE(ok)) stop(msg, call. = FALSE)
+need_file <- function(p, label = p) assert(file.exists(p), paste0("Missing file: ", label, "\nPath: ", p))
+need_dir  <- function(p, label = p) assert(dir.exists(p),  paste0("Missing dir: ",  label, "\nPath: ", p))
+
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0L) y else x
+
+# scientificName -> safe filename (MUST match other scripts)
+pname <- function(sci) {
+  x <- trimws(as.character(sci))
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[/\\\\:<>\"|?*]+", "_", x)
+  x <- gsub("[^A-Za-z0-9_]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  paste0(x, ".tif")
+}
+
+# stage helpers (contract: stage_0001 etc)
+stagetag <- function(s) sprintf("stage_%04d", as.integer(s))
+alive_name <- function(s, prefix) sprintf("%s%04d.tif", prefix, as.integer(s))
+
+# align raster to template grid (only used if auto_align=TRUE)
+align_to_template <- function(r, tpl) {
+  if (!terra::compareGeom(r, tpl, stopOnError = FALSE)) {
+    if (!terra::same.crs(r, tpl)) r <- terra::project(r, tpl, method = "near")
+    r <- terra::resample(r, tpl, method = "near")
+  }
+  r
+}
+
+# enforce 1/NA convention (used downstream by Script 10/11 logic)
+to_1na <- function(r) terra::ifel(!is.na(r) & (r != 0), 1L, NA_integer_)
+
+# parse a user stage selector like "1:20" or "c(1,5,9)" or ""
+parse_stages <- function(x) {
+  x <- trimws(as.character(x %||% ""))
+  if (!nzchar(x)) return(NULL)
+  out <- tryCatch(eval(parse(text = paste0("c(", x, ")"))), error = function(e) NULL)
+  assert(!is.null(out) && length(out) > 0L, "Could not parse params$restrict_stages (try '1:20' or '').")
+  as.integer(out)
+}
+
+# -------------------------
+# params
+# -------------------------
+curve <- as.character(params$curve)
+assert(curve %in% c("q50", "q16", "q025"),
+       "params$curve must be one of: 'q50', 'q16', 'q025'.")
+
+do_m <- isTRUE(params$do_mammals)
+do_b <- isTRUE(params$do_birds)
+assert(do_m || do_b, "Both do_mammals and do_birds are FALSE -> nothing to do.")
+
+do_build <- isTRUE(params$build)
+overwrite <- isTRUE(params$overwrite)
+auto_align <- isTRUE(params$auto_align)
+
+# -------------------------
+# paths (global contract)
+# -------------------------
+out_curve <- file.path("Spatial", paste0("Outputs_", curve))
+ana <- file.path(out_curve, as.character(params$ana_subdir))
+rank_alive_root <- file.path(ana, as.character(params$rank_alive_dir))
+int_root <- file.path(ana, as.character(params$int_dir))
+
+need_dir("Spatial", "Spatial/")
+need_dir(out_curve, paste0("Spatial/Outputs_", curve))
+dir.create(ana, recursive = TRUE, showWarnings = FALSE)
+need_dir(ana, "ana/")
+need_dir(rank_alive_root, "ana/rank_alive/")
+
+patch_dir <- as.character(params$patch_dir)
+need_dir(patch_dir, "patch_dir")
+
+init_path <- as.character(params$init_path)
+need_file(init_path, "init_path")
+
+# -------------------------
+# template grid (from init)
+# -------------------------
+init <- readRDS(init_path)
+assert(!is.null(init$patch_stack_file) && file.exists(init$patch_stack_file),
+       "init$patch_stack_file missing or does not exist.")
+tpl <- terra::rast(init$patch_stack_file)[[1]]
+rm(init); gc(FALSE)
+
+# -------------------------
+# species list (taxon-gated)
+# -------------------------
+need_file(as.character(params$species_csv), "species_csv")
+sp0 <- data.table::fread(as.character(params$species_csv), showProgress = FALSE)
+assert(all(c("scientificName", "className") %in% names(sp0)),
+       "species_table.csv must contain columns: scientificName, className")
+
+sp0[, scientificName := trimws(as.character(scientificName))]
+sp0[, class_lc := tolower(trimws(as.character(className)))]
+sp <- sp0[class_lc %in% c("mammalia", "aves")]
+sp <- sp[(class_lc == "mammalia" & do_m) | (class_lc == "aves" & do_b)]
+
+assert(nrow(sp) > 0L, "After taxon gating, zero species remain.")
+
+sp[, file := pname(scientificName)]
+assert(anyDuplicated(tolower(sp$file)) == 0L, "Duplicate species filenames after sanitization.")
+
+# Map species -> patch file on disk
+patch_files <- list.files(patch_dir, pattern = "\\.tif$", full.names = TRUE, ignore.case = TRUE)
+assert(length(patch_files) > 0L, paste0("No .tif files found in patch_dir: ", patch_dir))
+patch_dt <- data.table(patch_path = patch_files, file = basename(patch_files))
+patch_dt[, file_lc := tolower(file)]
+setkey(patch_dt, file_lc)
+
+sp[, file_lc := tolower(file)]
+setkey(sp, file_lc)
+
+sp <- patch_dt[sp, on = "file_lc"]          # adds patch_path
+assert(all(!is.na(sp$patch_path)),
+       paste0(
+         "Some selected species are missing patch rasters in patch_dir.\nMissing (first 30):\n",
+         paste(head(sp[is.na(patch_path), file], 30), collapse = "\n")
+       ))
+
+sp <- sp[, .(scientificName, class_lc, file, patch_path)]
+n_sp <- nrow(sp)
+
+# -------------------------
+# stages (from deterministic alive_stage_####.tif files)
+# -------------------------
+pref <- as.character(params$rank_alive_prefix)
+alive_files <- list.files(rank_alive_root, pattern = "\\.tif$", full.names = TRUE, ignore.case = TRUE)
+assert(length(alive_files) > 0L, paste0("No alive-stage masks found in: ", rank_alive_root))
+
+alive_base <- basename(alive_files)
+rx <- paste0("^", gsub("\\.", "\\\\.", pref), "([0-9]{4})\\.tif$")
+m <- regexec(rx, alive_base)
+mm <- regmatches(alive_base, m)
+ok <- lengths(mm) == 2L
+assert(any(ok),
+       paste0("No files matched expected pattern: ", rx, "\nExample files:\n",
+              paste(head(alive_base, 10), collapse = "\n")))
+
+st <- data.table(stage = as.integer(vapply(mm[ok], `[[`, character(1), 2)),
+                 alive_path = alive_files[ok])
+setorder(st, stage)
+
+sel <- parse_stages(params$restrict_stages)
+if (!is.null(sel)) {
+  st <- st[stage %in% sel]
+  assert(nrow(st) > 0L, "After restrict_stages filtering, no stages remain.")
+}
+
+# quick geometry policy check: tpl vs first alive + first patch
+alive1 <- terra::rast(st$alive_path[1])
+patch1 <- terra::rast(sp$patch_path[1])
+
+if (!auto_align) {
+  assert(terra::compareGeom(alive1, tpl, stopOnError = FALSE),
+         "Geometry mismatch: alive_stage_####.tif vs template (auto_align=FALSE).")
+  assert(terra::compareGeom(patch1, tpl, stopOnError = FALSE),
+         "Geometry mismatch: patch raster vs template (auto_align=FALSE).")
+}
+rm(alive1, patch1); gc(FALSE)
+
+# -------------------------
+# outputs + build gating
+# -------------------------
+dir.create(int_root, recursive = TRUE, showWarnings = FALSE)
+need_dir(int_root, "ana/rank_int/")
+
+stage_dirs <- file.path(int_root, vapply(st$stage, stagetag, character(1)))
+dirs_exist <- vapply(stage_dirs, dir.exists, logical(1))
+
+# counts per stage dir (0 if missing)
+counts <- integer(length(stage_dirs))
+counts[dirs_exist] <- vapply(stage_dirs[dirs_exist], function(d) {
+  length(list.files(d, pattern = "\\.tif$", ignore.case = TRUE))
+}, integer(1))
+
+complete <- all(dirs_exist) && all(counts == n_sp)
+
+run_work <- do_build && (overwrite || !complete)
+
+cat("\n=== Script 9: rank_int masks ===\n")
+cat("curve       :", curve, "\n")
+cat("out_curve   :", out_curve, "\n")
+cat("ana         :", ana, "\n")
+cat("rank_alive  :", rank_alive_root, "\n")
+cat("rank_int    :", int_root, "\n")
+cat("n species   :", n_sp, "\n")
+cat("n stages    :", nrow(st), "\n")
+cat("auto_align  :", auto_align, "\n")
+cat("build       :", do_build, "\n")
+cat("overwrite   :", overwrite, "\n")
+cat("complete    :", complete, "\n")
+cat("=> will run :", run_work, "\n\n")
+```
+
+```{r}
+# ============================================================
+# 01_build — write ana/rank_int/stage_####/<species>.tif
+# Each output raster is 1/NA:
+#   out = patch_binary ∩ alive_stage_mask
+# ============================================================
+
+if (!run_work) {
+  cat("[build] Skipping (either build=FALSE or outputs already complete and overwrite=FALSE).\n")
+} else {
+
+  wopt <- list(
+    datatype = "INT1U",
+    gdal = c("TILED=YES", "COMPRESS=LZW", "BIGTIFF=IF_SAFER")
+  )
+
+  for (k in seq_len(nrow(st))) {
+    s <- as.integer(st$stage[k])
+    s_dir <- file.path(int_root, stagetag(s))
+    dir.create(s_dir, recursive = TRUE, showWarnings = FALSE)
+
+    # Load alive mask once per stage
+    a <- terra::rast(st$alive_path[k])
+    if (auto_align) a <- align_to_template(a, tpl)
+    a01 <- to_1na(a)
+    rm(a); gc(FALSE)
+
+    cat(sprintf("[build] stage %04d: %d species -> %s\n", s, n_sp, basename(s_dir)))
+
+    for (i in seq_len(n_sp)) {
+      out_path <- file.path(s_dir, sp$file[i])
+      if (file.exists(out_path) && !overwrite) next
+
+      p <- terra::rast(sp$patch_path[i])
+      if (auto_align) p <- align_to_template(p, tpl)
+      p01 <- to_1na(p)
+      rm(p); gc(FALSE)
+
+      # intersection (1/NA)
+      out <- terra::ifel(p01 == 1L & a01 == 1L, 1L, NA_integer_)
+      rm(p01); gc(FALSE)
+
+      terra::writeRaster(out, out_path, overwrite = TRUE, wopt = wopt)
+      rm(out); gc(FALSE)
+    }
+
+    rm(a01); gc(FALSE)
+  }
+
+  cat("[build] Done.\n")
+}
+```
+
+```{r}
+# ============================================================
+# 02_verify — lightweight inventory table (always runs)
+# ============================================================
+
+stage_dirs <- file.path(int_root, vapply(st$stage, stagetag, character(1)))
+dir_exists <- vapply(stage_dirs, dir.exists, logical(1))
+
+n_tif <- integer(length(stage_dirs))
+n_tif[dir_exists] <- vapply(stage_dirs[dir_exists], function(d) {
+  length(list.files(d, pattern = "\\.tif$", ignore.case = TRUE))
+}, integer(1))
+
+inv <- data.table(
+  stage = st$stage,
+  dir   = basename(stage_dirs),
+  dir_exists = dir_exists,
+  n_tif = n_tif,
+  expected = n_sp,
+  ok = dir_exists & (n_tif == n_sp)
+)
+
+cat("\n=== rank_int inventory ===\n")
+cat("rank_int:", int_root, "\n")
+print(inv)
+cat("\nStages OK:", sum(inv$ok), "/", nrow(inv), "\n")
+```
