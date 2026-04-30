@@ -61,6 +61,14 @@ assert(
 RAW_DIR   <- "Data/Raw"
 CLEAN_DIR <- "Data/Clean"
 
+raster_sources <- tibble::tribble(
+  ~taxon_class, ~sdm_method, ~dir_path,
+  "Mammalia",   "PPM",       "mammal_ppm_bin",
+  "Mammalia",   "RangeBag",  "mammal_rangebag_bin",
+  "Aves",       "PPM",       "bird_ppm_bin",
+  "Aves",       "RangeBag",  "bird_rangebag_bin"
+)
+
 paths <- list(
   # Raw inputs
   summary_csv    = file.path(RAW_DIR, "simple_summary.csv"),
@@ -69,9 +77,8 @@ paths <- list(
   bird_raw       = file.path(RAW_DIR, "bird_data.txt"),
   random_effects = file.path(RAW_DIR, "random_effects.csv"),
 
-  # Presence rasters (working directory)
-  mammal_dir     = "mammal_ppm_bin",
-  bird_dir       = "bird_ppm_bin",
+  # Presence rasters (all SDM sources)
+  raster_sources = raster_sources,
 
   # Models (only required if any Gompertz flag is TRUE)
   loess_rds      = file.path(CLEAN_DIR, "gompertz_loess_models.rds"),
@@ -80,7 +87,7 @@ paths <- list(
   out_csv        = file.path(CLEAN_DIR, "species_table.csv")
 )
 
-# Ensure output directory exists (this is setup, not “validation logic” elsewhere)
+# Ensure output directory exists
 if (!dir.exists(CLEAN_DIR)) dir.create(CLEAN_DIR, recursive = TRUE, showWarnings = FALSE)
 need_dir(CLEAN_DIR, "Data/Clean (output directory)")
 
@@ -102,8 +109,16 @@ need_file(paths$synonyms,       "Data/Raw/synonyms.csv")
 need_file(paths$mammal_raw,     "Data/Raw/mammal_data.txt")
 need_file(paths$bird_raw,       "Data/Raw/bird_data.txt")
 need_file(paths$random_effects, "Data/Raw/random_effects.csv")
-need_dir(paths$mammal_dir,      "mammal_ppm_bin (presence rasters)")
-need_dir(paths$bird_dir,        "bird_ppm_bin (presence rasters)")
+for (i in seq_len(nrow(paths$raster_sources))) {
+  need_dir(
+    paths$raster_sources$dir_path[[i]],
+    paste0(
+      paths$raster_sources$dir_path[[i]], " (",
+      paths$raster_sources$taxon_class[[i]], ", ",
+      paths$raster_sources$sdm_method[[i]], " presence rasters)"
+    )
+  )
+}
 
 # =============================================================================
 # 6) Minimal header checks
@@ -259,10 +274,28 @@ count_bin <- function(dir_path) {
   stems <- tools::file_path_sans_ext(f) |> stringr::str_to_lower()
   sum(stringr::str_ends(stems, "_bin"))
 }
+
+raster_counts <- paths$raster_sources |>
+  dplyr::mutate(n_bin = vapply(dir_path, count_bin, integer(1)))
+
 assert(
-  (count_bin(paths$mammal_dir) + count_bin(paths$bird_dir)) > 0,
-  "No '*_bin' rasters found in mammal_ppm_bin or bird_ppm_bin."
+  sum(raster_counts$n_bin) > 0,
+  "No '*_bin' rasters found across the configured raster source directories."
 )
+
+if (isTRUE(HAS_MAMMAL_ROWS)) {
+  assert(
+    sum(raster_counts$n_bin[raster_counts$taxon_class == "Mammalia"]) > 0,
+    "No mammal '*_bin' rasters found across mammal PPM / RangeBag directories."
+  )
+}
+
+if (isTRUE(HAS_BIRD_ROWS)) {
+  assert(
+    sum(raster_counts$n_bin[raster_counts$taxon_class == "Aves"]) > 0,
+    "No bird '*_bin' rasters found across bird PPM / RangeBag directories."
+  )
+}
 
 # =============================================================================
 # 12) Gompertz LOESS models (only required if any Gompertz flag is TRUE)
@@ -358,11 +391,32 @@ read_synonyms <- function(path) {
 }
 
 # List "*_bin" raster stems from a directory (no extensions)
-list_raster_stems <- function(dir_path) {
-  list.files(dir_path, full.names = FALSE) |>
-    tools::file_path_sans_ext() |>
-    stringr::str_to_lower() |>
-    (\(x) x[stringr::str_ends(x, "_bin")])()
+list_raster_manifest <- function(raster_sources) {
+  out <- lapply(seq_len(nrow(raster_sources)), function(i) {
+    src <- raster_sources[i, , drop = FALSE]
+
+    files <- list.files(src$dir_path[[1]], full.names = TRUE)
+    if (!length(files)) return(NULL)
+
+    tibble::tibble(
+      taxon_class = src$taxon_class[[1]],
+      sdm_method  = src$sdm_method[[1]],
+      raster_dir  = src$dir_path[[1]],
+      raster_path = files,
+      raster_file = basename(files),
+      raster_stem = tools::file_path_sans_ext(basename(files)) |>
+        stringr::str_to_lower()
+    ) |>
+      dplyr::filter(stringr::str_ends(raster_stem, "_bin")) |>
+      dplyr::mutate(
+        raster_candidate = stringr::str_replace(raster_stem, "_bin$", ""),
+        sdm_priority = dplyr::if_else(sdm_method == "PPM", 0L, 1L)
+      )
+  })
+
+  dplyr::bind_rows(out) |>
+    dplyr::arrange(taxon_class, sdm_priority, raster_file) |>
+    dplyr::distinct(taxon_class, sdm_method, raster_stem, .keep_all = TRUE)
 }
 
 # Read trait tables as character, then parse BodyMass.Value (grams) and add stable join key.
@@ -728,7 +782,6 @@ summary_df <- readr::read_csv(paths$summary_csv, show_col_types = FALSE) |>
   dplyr::mutate(
     row_id = dplyr::row_number(),
     scientificName = stringr::str_squish(as.character(scientificName)),
-    # Stable class label used throughout this pipeline
     taxon_class = dplyr::case_when(
       stringr::str_to_lower(stringr::str_squish(as.character(className))) == "mammalia" ~ "Mammalia",
       stringr::str_to_lower(stringr::str_squish(as.character(className))) == "aves"     ~ "Aves",
@@ -738,77 +791,105 @@ summary_df <- readr::read_csv(paths$summary_csv, show_col_types = FALSE) |>
 
 syn_map <- read_synonyms(paths$synonyms)
 
-raster_mam <- list_raster_stems(paths$mammal_dir)
-raster_brd <- list_raster_stems(paths$bird_dir)
+raster_manifest <- list_raster_manifest(paths$raster_sources)
 
 traits_all <- dplyr::bind_rows(
   read_traits(paths$mammal_raw, "Mammalia"),
   read_traits(paths$bird_raw,   "Aves")
 )
 
-# Fast lookup keys for trait existence (class-aware)
 trait_key_index <- unique(paste(traits_all$taxon_class, traits_all$trait_clean, sep = "||"))
 
-# Only load Gompertz models if we will actually fill values
 models <- NULL
 if (isTRUE(DO_GOMPERTZ_MAMMALS) || isTRUE(DO_GOMPERTZ_BIRDS)) {
   models <- readRDS(paths$loess_rds)
 }
 
 # ------------------------------------------------------------------------------
-# 2) Resolve ONE raster + ONE trait per row (original preferred, then synonym)
+# 2) Resolve ONE raster + ONE trait per row
+#    Raster preference:
+#      1) PPM over RangeBag
+#      2) original name over synonym
+#    Trait preference:
+#      1) original name over synonym
 # ------------------------------------------------------------------------------
 cands <- dplyr::bind_rows(
-  # Candidate = original scientificName
   summary_df |>
-    dplyr::transmute(row_id, taxon_class, candidate = scientificName, kind = "original"),
+    dplyr::transmute(
+      row_id,
+      taxon_class,
+      candidate = scientificName,
+      kind = "original"
+    ),
 
-  # Candidate = synonym genus+species (via synonyms.csv)
   summary_df |>
     dplyr::select(row_id, taxon_class, scientificName) |>
     dplyr::left_join(syn_map, by = c("scientificName" = "orig")) |>
-    dplyr::transmute(row_id, taxon_class, candidate = syn, kind = "synonym")
+    dplyr::transmute(
+      row_id,
+      taxon_class,
+      candidate = syn,
+      kind = "synonym"
+    )
 ) |>
   dplyr::filter(!is.na(candidate), nzchar(candidate), !is.na(taxon_class)) |>
   dplyr::mutate(
-    # Raster check is class-aware (mammals use mammal_dir, birds use bird_dir)
-    stem = to_stem(candidate),
-    raster_ok =
-      (taxon_class == "Mammalia" & stem %in% raster_mam) |
-      (taxon_class == "Aves"     & stem %in% raster_brd),
-
-    # Trait check is class-aware
+    stem        = to_stem(candidate),
     trait_clean = clean_nm(candidate),
-    trait_ok = paste(taxon_class, trait_clean, sep = "||") %in% trait_key_index,
-
-    # Original names win ties
-    prio = dplyr::if_else(kind == "original", 0L, 1L)
+    trait_ok    = paste(taxon_class, trait_clean, sep = "||") %in% trait_key_index,
+    name_prio   = dplyr::if_else(kind == "original", 0L, 1L)
   )
 
-pick_first <- function(df, ok_col, out_name, out_tag) {
-  df |>
-    dplyr::filter(.data[[ok_col]]) |>
-    dplyr::group_by(row_id) |>
-    dplyr::arrange(prio) |>
-    dplyr::slice(1) |>
-    dplyr::ungroup() |>
-    dplyr::transmute(
-      row_id,
-      !!out_name := candidate,
-      !!out_tag  := kind
-    )
-}
+raster_cands <- cands |>
+  dplyr::left_join(
+    raster_manifest |>
+      dplyr::select(
+        taxon_class,
+        raster_stem,
+        sdm_method,
+        raster_dir,
+        raster_path,
+        raster_file,
+        sdm_priority
+      ),
+    by = c("taxon_class", "stem" = "raster_stem")
+  ) |>
+  dplyr::mutate(raster_ok = !is.na(raster_path))
 
-raster_pick <- pick_first(cands, "raster_ok", "name_raster", "match_raster")
-trait_pick  <- pick_first(cands, "trait_ok",  "name_trait",  "match_trait")
+raster_pick <- raster_cands |>
+  dplyr::filter(raster_ok) |>
+  dplyr::group_by(row_id) |>
+  dplyr::arrange(sdm_priority, name_prio, candidate, .by_group = TRUE) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup() |>
+  dplyr::transmute(
+    row_id,
+    name_raster  = candidate,
+    match_raster = kind,
+    raster_stem  = stem,
+    sdm_method,
+    raster_dir,
+    raster_file,
+    raster_path
+  )
+
+trait_pick <- cands |>
+  dplyr::filter(trait_ok) |>
+  dplyr::group_by(row_id) |>
+  dplyr::arrange(name_prio, candidate, .by_group = TRUE) |>
+  dplyr::slice(1) |>
+  dplyr::ungroup() |>
+  dplyr::transmute(
+    row_id,
+    name_trait  = candidate,
+    match_trait = kind
+  )
 
 dat <- summary_df |>
   dplyr::left_join(raster_pick, by = "row_id") |>
   dplyr::left_join(trait_pick,  by = "row_id") |>
-  # Keep only rows that match BOTH raster + trait
-  dplyr::filter(!is.na(name_raster), !is.na(name_trait)) |>
+  dplyr::filter(!is.na(raster_path), !is.na(name_trait)) |>
   dplyr::mutate(
-    raster_stem = to_stem(name_raster),
     trait_clean = clean_nm(name_trait)
   ) |>
   dplyr::select(-row_id)
@@ -1029,6 +1110,7 @@ keep_cols <- c(
   "scientificName", "className", "orderName", "familyName", "genusName", "speciesName",
   "redlistCategory",
   "raster_stem", "name_raster", "match_raster",
+  "sdm_method", "raster_dir", "raster_file", "raster_path",
   "name_trait",  "match_trait",
 
   # Core covariates used downstream
