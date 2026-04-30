@@ -65,7 +65,7 @@ sf::sf_use_s2(TRUE)
 # 3) Paths (centralized)
 # =============================================================================
 paths <- list(
-  # Canonical species table produced by Untitled4
+  # Canonical species table produced by 4_build_species_table.Rmd
   species_csv   = "Data/Clean/species_table.csv",
 
   # Landcover source (always)
@@ -74,11 +74,7 @@ paths <- list(
   # Required outputs (and only outputs)
   patch_dir     = "Data/Clean/Patches",
   patch_lookup  = "Data/Clean/all_patch_lookup.rds",
-  connectivity  = "Data/Clean/all_connectivity.rds",
-
-  # Presence rasters live in working directory
-  mammal_dir    = "mammal_ppm_bin",
-  bird_dir      = "bird_ppm_bin"
+  connectivity  = "Data/Clean/all_connectivity.rds"
 )
 
 # ROI (pipeline standard)
@@ -102,9 +98,6 @@ need_dir(paths$patch_dir, "Data/Clean/Patches (patch raster output directory)")
 need_file(paths$species_csv,   "Data/Clean/species_table.csv")
 need_file(paths$landcover_tif, "Data/Raw/esacci_2022_pfts.tif")
 
-if (DO_MAMMALS) need_dir(paths$mammal_dir, "mammal_ppm_bin (presence rasters)")
-if (DO_BIRDS)   need_dir(paths$bird_dir,   "bird_ppm_bin (presence rasters)")
-
 # =============================================================================
 # 6) Species-table schema + content checks (fail-fast)
 # =============================================================================
@@ -112,7 +105,10 @@ need_cols <- c(
   "scientificName",
   "className",
   "habitats_mixed",
-  "raster_stem",
+  "raster_path",
+  "sdm_method",
+  "raster_dir",
+  "raster_file",
   "min_patch_size",
   "min_pop_size",
   "dispersal_dist"
@@ -134,7 +130,7 @@ sp <- readr::read_csv(
     scientificName = stringr::str_squish(as.character(scientificName)),
     class_lc       = stringr::str_to_lower(stringr::str_squish(as.character(className))),
     habitats_mixed = stringr::str_squish(as.character(habitats_mixed)),
-    raster_stem    = stringr::str_to_lower(stringr::str_squish(as.character(raster_stem))),
+    raster_path    = stringr::str_squish(as.character(raster_path)),
     min_patch_km2  = suppressWarnings(readr::parse_number(as.character(min_patch_size))),
     min_pop_km2    = suppressWarnings(readr::parse_number(as.character(min_pop_size))),
     disp_km        = suppressWarnings(readr::parse_number(as.character(dispersal_dist)))
@@ -153,8 +149,17 @@ assert(all(nzchar(sp$scientificName[selected])),
        "species_table.csv has empty scientificName in row(s) selected for processing.")
 assert(all(nzchar(sp$habitats_mixed[selected])),
        "species_table.csv has empty habitats_mixed in row(s) selected for processing.")
-assert(all(nzchar(sp$raster_stem[selected])),
-       "species_table.csv has empty raster_stem in row(s) selected for processing.")
+assert(all(nzchar(sp$raster_path[selected])),
+       "species_table.csv has empty raster_path in row(s) selected for processing.")
+
+missing_rasters <- unique(sp$raster_path[selected & (!file.exists(sp$raster_path))])
+assert(
+  length(missing_rasters) == 0,
+  paste0(
+    "species_table.csv contains raster_path value(s) that do not exist on disk for selected row(s):\n",
+    paste(head(missing_rasters, 20), collapse = "\n")
+  )
+)
 
 assert(all(is.finite(sp$min_patch_km2[selected]) & sp$min_patch_km2[selected] > 0),
        "species_table.csv has non-positive / non-numeric min_patch_size in selected row(s).")
@@ -181,52 +186,14 @@ assert(length(dup) == 0,
               "Example duplicate(s): ", paste(head(dup, 10), collapse = ", ")))
 
 # =============================================================================
-# 7) Presence raster inventory (FAIL-FAST if a selected stem is missing)
-# =============================================================================
-list_bin_stems <- function(dir_path) {
-  ff <- list.files(dir_path, pattern = "_bin\\.tif$", full.names = FALSE, ignore.case = TRUE)
-  if (!length(ff)) return(character(0))
-  tools::file_path_sans_ext(ff) |> stringr::str_to_lower()
-}
-
-if (DO_MAMMALS) {
-  mam_stems <- list_bin_stems(paths$mammal_dir)
-  assert(length(mam_stems) > 0, paste0("No '*_bin.tif' rasters found in ", paths$mammal_dir))
-
-  want <- unique(sp$raster_stem[selected & is_mam])
-  want <- want[nzchar(want)]
-  miss <- setdiff(want, mam_stems)
-
-  # User requirement: missing presence rasters for selected species must STOP (fail-fast)
-  assert(length(miss) == 0,
-         paste0("Missing mammal presence raster(s) for selected species.\n",
-                "These raster_stem values have no matching *_bin.tif in ", paths$mammal_dir, ":\n",
-                paste(head(miss, 20), collapse = ", ")))
-}
-
-if (DO_BIRDS) {
-  brd_stems <- list_bin_stems(paths$bird_dir)
-  assert(length(brd_stems) > 0, paste0("No '*_bin.tif' rasters found in ", paths$bird_dir))
-
-  want <- unique(sp$raster_stem[selected & is_brd])
-  want <- want[nzchar(want)]
-  miss <- setdiff(want, brd_stems)
-
-  assert(length(miss) == 0,
-         paste0("Missing bird presence raster(s) for selected species.\n",
-                "These raster_stem values have no matching *_bin.tif in ", paths$bird_dir, ":\n",
-                paste(head(miss, 20), collapse = ", ")))
-}
-
-# =============================================================================
-# 8) fasterRaster + GRASS backend (required)
+# 7) fasterRaster + GRASS backend (required)
 # =============================================================================
 assert(dir.exists(grassDir), paste0("GRASS directory does not exist:\n", grassDir))
 # If GRASS/fasterRaster isn't configured properly, this should error and stop right here.
 fasterRaster::faster(grassDir = grassDir)
 
 # =============================================================================
-# 9) Success message
+# 8) Success message
 # =============================================================================
 message(
   "Validation OK | DO_MAMMALS=", DO_MAMMALS,
@@ -525,10 +492,6 @@ build_pu_connectivity <- function(nb, patches_sf, patch_to_pop_kept, final_patch
 # 1) One-time indexes and species table (reuse the validated `sp` from chunk 1)
 # ------------------------------------------------------------------------------
 
-# Presence raster lookup tables (avoid listing files inside the species loop)
-presence_index_mam <- if (DO_MAMMALS) make_presence_index(paths$mammal_dir) else NULL
-presence_index_brd <- if (DO_BIRDS)   make_presence_index(paths$bird_dir)   else NULL
-
 # Species rows to process (already normalized in chunk 1 into `sp`)
 species_df <- sp |>
   dplyr::filter((class_lc == "mammalia" & DO_MAMMALS) | (class_lc == "aves" & DO_BIRDS)) |>
@@ -536,7 +499,10 @@ species_df <- sp |>
     scientificName,
     class_lc,
     habitats_mixed,
-    raster_stem,
+    raster_path,
+    sdm_method,
+    raster_dir,
+    raster_file,
     min_patch_km2,
     min_pop_km2,
     disp_km
@@ -584,18 +550,16 @@ for (i in seq_len(nrow(species_df))) {
 
   sci <- species_df$scientificName[i]
   log_step(sci, "START")
-
-  # ---- presence raster (fail-fast if missing; should not happen after chunk 1)
-  stem <- species_df$raster_stem[i]
-  pres_path <- if (species_df$class_lc[i] == "mammalia") {
-    presence_index_mam[[stem]]
-  } else {
-    presence_index_brd[[stem]]
-  }
-  if (is.null(pres_path) || is.na(pres_path)) {
-    stop("Presence raster missing for selected species: ", sci,
-         " | raster_stem=", stem, call. = FALSE)
-  }
+  log_step(
+    sci,
+    paste0(
+      "RASTER | method=", species_df$sdm_method[i],
+      " | file=", basename(species_df$raster_path[i])
+    )
+  )
+  
+  # ---- presence raster (already validated in chunk 1)
+  pres_path <- species_df$raster_path[i]
 
   # ---- habitat masks for this species (ignore unknown labels)
   lbls <- parse_habitats_mixed(species_df$habitats_mixed[i])
@@ -815,45 +779,91 @@ for (f in patch_files) {
 ```
 
 ```{r}
-## ---- patches_to_binary ------------------------------------------------------
-## Convert patch rasters (patch IDs / NA) -> binary rasters (1 / NA).
-##
-## Input:
-##   - Data/Clean/Patches/*.tif    (cells are NA or integer patch IDs)
-## Output (new, minimal additional output folder):
-##   - Data/Clean/Patches_binary/*.tif  (cells are NA or 1)
+## ---- build_binary_patch_rasters_blockwise -----------------------------------
+library(data.table)
+library(terra)
+library(stringr)
 
-bin_dir <- file.path("Data/Clean", "Patches_binary")
-dir.create(bin_dir, recursive = TRUE, showWarnings = FALSE)
+filtered_species_csv <- "Data/Clean/species_table_with_patches_only.csv"
+patch_dir            <- "Data/Clean/Patches"
+out_dir              <- "Data/Clean/Patches_binary_with_patches_only"
 
-patch_files <- list.files(paths$patch_dir, pattern = "\\.tif$", full.names = TRUE)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-if (!length(patch_files)) {
-  message("No patch rasters found in ", paths$patch_dir, " (nothing to convert).")
-} else {
-  for (f in patch_files) {
-    r <- terra::rast(f)
+# Optional: rebuild folder from scratch
+unlink(list.files(out_dir, pattern = "\\.tif$", full.names = TRUE))
 
-    # Any non-NA value becomes 1; NA stays NA
-    r_bin <- terra::ifel(is.na(r), NA_integer_, 1L)
+# Give terra a temp directory with plenty of space
+terra_tmp <- file.path(tempdir(), "terra_tmp")
+dir.create(terra_tmp, recursive = TRUE, showWarnings = FALSE)
+terraOptions(memfrac = 0.2, tempdir = terra_tmp, progress = 1)
 
-    out_f <- file.path(bin_dir, basename(f))
-    terra::writeRaster(
-      r_bin,
-      filename  = out_f,
-      overwrite = TRUE,
-      wopt = list(
-        datatype = "INT1U",
-        gdal = c(
-          "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
-          "COMPRESS=LZW", "BIGTIFF=IF_SAFER"
-        )
+sp <- fread(filtered_species_csv)
+
+species_id_from_scientific <- function(sci) {
+  x <- str_squish(as.character(sci))
+  x <- str_replace_all(x, "\\s+", "_")
+  x <- str_replace_all(x, "[/\\\\:<>\"|?*]+", "_")
+  x <- str_replace_all(x, "[^A-Za-z0-9_]+", "_")
+  x <- str_replace_all(x, "_+", "_")
+  x <- str_replace_all(x, "^_|_$", "")
+  x
+}
+
+sp[, species_id := species_id_from_scientific(scientificName)]
+sp[, patch_file := file.path(patch_dir, paste0(species_id, ".tif"))]
+sp <- sp[file.exists(patch_file)]
+
+for (i in seq_len(nrow(sp))) {
+  in_file  <- sp$patch_file[i]
+  out_file <- file.path(out_dir, paste0(sp$species_id[i], ".tif"))
+
+  cat("Processing:", basename(in_file), "\n")
+
+  r <- rast(in_file)
+
+  # Output raster template
+  out <- rast(r)
+
+  # Start block-wise read/write
+  readStart(r)
+  out <- writeStart(
+    out,
+    filename = out_file,
+    overwrite = TRUE,
+    wopt = list(
+      datatype = "INT1U",
+      gdal = c(
+        "TILED=YES",
+        "BLOCKXSIZE=512",
+        "BLOCKYSIZE=512",
+        "COMPRESS=LZW",
+        "BIGTIFF=IF_SAFER"
       )
     )
+  )
+
+  bs <- blocks(r)
+
+  for (j in seq_len(bs$n)) {
+    v <- readValues(r, row = bs$row[j], nrows = bs$nrows[j], mat = FALSE)
+
+    # Patch rasters are patch IDs / NA
+    # Convert any non-NA value to 1, keep NA as NA
+    v[!is.na(v)] <- 1L
+
+    out <- writeValues(out, v, bs$row[j])
   }
 
-  message("Wrote binary patch rasters to: ", bin_dir, " (n=", length(patch_files), ")")
+  out <- writeStop(out)
+  readStop(r)
+
+  rm(r, out, bs, v)
+  gc()
 }
+
+cat("Wrote binary patch rasters to:", out_dir, "\n")
+cat("Files written:", nrow(sp), "\n")
 ```
 
 ```{r}
