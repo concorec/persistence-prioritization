@@ -1,0 +1,1194 @@
+
+
+---
+title: "7.2_build_rank_lut"
+output: html_document
+params:
+  # ---- run identity ----
+  curve: "q025"
+
+  # ---- matched persistence-prioritization run ----
+  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc_remove_1000_k_100"
+  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc.rds"
+
+  # ---- inputs ----
+  ana_subdir: "ana"
+  stage_meta_name: "stage_meta.csv"
+
+  rank_path: "Data/Results/BenchmarkRankMaps/rankmap_abf.tif"
+  species_csv: "Data/Clean/species_table.csv"
+  patch_dir: "Data/Clean/Patches"
+
+  # ---- outputs, under pipeline_output_dir/ana/<lut_dir>/ ----
+  lut_dir: "rank_lut_abf"
+  lut_prefix: "lut_stage_"
+  target_summary_name: "rank_stage_targets_abf.csv"
+  inventory_name: "rank_lut_inventory_abf.csv"
+
+  # ---- matching behavior ----
+  match_basis: "area"              # "area" or "cells"; use "area" for main analysis
+  rank_higher_is_better: true      # true if higher rank values should be retained first
+  include_stage0: true
+  restrict_stages: ""              # "" for all stages, or e.g. "0:20"
+
+  # ---- raster/spatial behavior ----
+  auto_align_rank: true
+  rank_resample_method: "near"
+
+  clump_backend: "fasterRaster"    # "fasterRaster" or "terra"
+  grassDir: "C:/Program Files/GRASS GIS 8.4"
+
+  # ---- efficiency / debugging ----
+  use_monotone_cache: true
+  write_debug_masks: false
+  debug_mask_dir: "rank_debug_masks"
+
+  # ---- controls ----
+  overwrite: true
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(terra)
+  library(sf)
+  library(igraph)
+  library(data.table)
+  library(units)
+})
+
+if (requireNamespace("fasterRaster", quietly = TRUE)) {
+  # optional: attach if you really want
+}
+
+# ============================================================
+# 00_setup — packages, helpers, paths
+# ============================================================
+
+assert <- function(ok, msg) {
+  if (!isTRUE(ok)) stop(msg, call. = FALSE)
+}
+
+need_file <- function(p, label = p) {
+  assert(file.exists(p), paste0("Missing file: ", label, "\nPath: ", p))
+}
+
+need_dir <- function(p, label = p) {
+  assert(dir.exists(p), paste0("Missing dir: ", label, "\nPath: ", p))
+}
+
+stagetag <- function(x) sprintf("%04d", as.integer(x))
+
+sid <- function(scientific_name) {
+  x <- trimws(as.character(scientific_name))
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[/\\\\:<>\"|?*]+", "_", x)
+  x <- gsub("[^A-Za-z0-9_]+", "_", x)
+  x <- gsub("_+", "_", x)
+  gsub("^_|_$", "", x)
+}
+
+patch_file_from_name <- function(scientific_name, patch_dir) {
+  file.path(patch_dir, paste0(sid(scientific_name), ".tif"))
+}
+
+parse_stage_selector <- function(x, available_stages) {
+  x <- trimws(as.character(x))
+  if (!nzchar(x)) return(sort(unique(available_stages)))
+
+  if (grepl("^\\d+\\s*:\\s*\\d+$", x)) {
+    z <- as.integer(strsplit(gsub("\\s+", "", x), ":")[[1]])
+    return(intersect(seq(z[1], z[2]), available_stages))
+  }
+
+  nums <- as.integer(unlist(regmatches(x, gregexpr("\\d+", x))))
+  intersect(nums, available_stages)
+}
+
+empty_lut <- function(stage = integer()) {
+  data.table(
+    stage = integer(),
+    method = character(),
+    scientificName = character(),
+    species = character(),
+    patch_id = integer(),
+    pu_id = integer(),
+    patch_area_km2 = numeric(),
+    patch_n_cells = integer()
+  )
+}
+
+# ============================================================
+# Params
+# ============================================================
+
+curve <- as.character(params$curve)
+assert(curve %in% c("q50", "q16", "q025"),
+       "params$curve must be q50, q16, or q025.")
+
+match_basis <- as.character(params$match_basis)
+assert(match_basis %in% c("area", "cells"),
+       "params$match_basis must be 'area' or 'cells'.")
+
+rank_higher_is_better <- isTRUE(params$rank_higher_is_better)
+overwrite <- isTRUE(params$overwrite)
+include_stage0 <- isTRUE(params$include_stage0)
+use_monotone_cache <- isTRUE(params$use_monotone_cache)
+
+clump_backend <- as.character(params$clump_backend)
+assert(clump_backend %in% c("fasterRaster", "terra"),
+       "params$clump_backend must be 'fasterRaster' or 'terra'.")
+
+grassDir <- as.character(params$grassDir)
+
+has_fr <- requireNamespace("fasterRaster", quietly = TRUE)
+
+if (identical(clump_backend, "fasterRaster")) {
+  assert(has_fr, "clump_backend='fasterRaster' but fasterRaster is not installed.")
+  need_dir(grassDir, "GRASS installation directory")
+  fasterRaster::faster(grassDir = grassDir)
+}
+
+# ============================================================
+# Paths
+# ============================================================
+
+out_curve <- as.character(params$pipeline_output_dir)
+bundle_path <- as.character(params$pruning_input_bundle_path)
+
+ana <- file.path(out_curve, as.character(params$ana_subdir))
+stage_meta_csv <- file.path(ana, as.character(params$stage_meta_name))
+
+rank_path <- as.character(params$rank_path)
+species_csv <- as.character(params$species_csv)
+patch_dir <- as.character(params$patch_dir)
+
+lut_root <- file.path(ana, as.character(params$lut_dir))
+dir.create(lut_root, recursive = TRUE, showWarnings = FALSE)
+
+target_summary_csv <- file.path(lut_root, as.character(params$target_summary_name))
+inventory_csv <- file.path(lut_root, as.character(params$inventory_name))
+
+lut_prefix <- as.character(params$lut_prefix)
+
+need_dir(out_curve, "pipeline_output_dir")
+need_file(bundle_path, "pruning input bundle")
+need_file(stage_meta_csv, "stage_meta.csv from 7.1")
+need_file(rank_path, "benchmark rank map")
+need_file(species_csv, "species_table.csv")
+need_dir(patch_dir, "patch raster directory")
+need_dir(lut_root, "rank_lut output directory")
+
+cat("\n=== 7.2_build_rank_lut ===\n")
+cat("pipeline_output_dir:", out_curve, "\n")
+cat("ana                :", ana, "\n")
+cat("rank_path          :", rank_path, "\n")
+cat("lut_root           :", lut_root, "\n")
+cat("match_basis        :", match_basis, "\n")
+cat("rank_higher_is_better:", rank_higher_is_better, "\n\n")
+```
+
+---
+
+# Chunk 01 — load and validate inputs
+
+Purpose: load `stage_meta.csv`, bundle, species table, template raster, and benchmark rank map.
+
+Use the **bundle retained species list** as the authoritative species set. Do not re-filter mammals/birds/PPM/RangeBag here; that was already done when the script-6 priority input bundle was created.
+
+```{r}
+# ============================================================
+# 01_load_inputs — stage_meta, bundle, species table, rank map
+# ============================================================
+
+bundle <- readRDS(bundle_path)
+
+required_bundle_fields <- c(
+  "metadata",
+  "alive_species_count_by_cell",
+  "cell_area_by_cell",
+  "patch_table"
+)
+
+missing_bundle_fields <- setdiff(required_bundle_fields, names(bundle))
+assert(!length(missing_bundle_fields),
+       paste("Bundle is missing field(s):", paste(missing_bundle_fields, collapse = ", ")))
+
+assert(!is.null(bundle$metadata$retained_species),
+       "Bundle metadata is missing retained_species.")
+
+retained_species <- as.character(bundle$metadata$retained_species)
+
+alive0 <- as.integer(bundle$alive_species_count_by_cell) > 0L
+cell_area_by_cell <- as.numeric(bundle$cell_area_by_cell)
+
+stage_meta <- fread(stage_meta_csv)
+
+required_stage_cols <- c(
+  "stage",
+  "alive_end",
+  "area_retained_km2",
+  "prop_area_removed_end",
+  "pct_removed_end"
+)
+
+missing_stage_cols <- setdiff(required_stage_cols, names(stage_meta))
+assert(!length(missing_stage_cols),
+       paste("stage_meta.csv is missing column(s):", paste(missing_stage_cols, collapse = ", ")))
+
+assert(stage_meta[stage == 0L, .N] == 1L,
+       "stage_meta.csv must contain exactly one stage 0 row.")
+
+setorder(stage_meta, stage)
+
+species_table <- fread(species_csv)
+
+required_species_cols <- c(
+  "scientificName",
+  "min_patch_size",
+  "min_pop_size",
+  "dispersal_dist"
+)
+
+missing_species_cols <- setdiff(required_species_cols, names(species_table))
+assert(!length(missing_species_cols),
+       paste("species_table.csv is missing column(s):",
+             paste(missing_species_cols, collapse = ", ")))
+
+sp <- species_table[scientificName %in% retained_species]
+assert(nrow(sp) == length(retained_species),
+       "species_table does not contain exactly the retained species in the bundle.")
+
+sp[, species := sid(scientificName)]
+sp[, patch_path := patch_file_from_name(scientificName, patch_dir)]
+
+missing_patch <- sp[!file.exists(patch_path)]
+assert(nrow(missing_patch) == 0L,
+       paste("Missing patch raster(s):",
+             paste(missing_patch$patch_path, collapse = "\n")))
+
+# Use removal_order.tif as the template because it is guaranteed to match
+# the optimized priority run.
+template_path <- file.path(out_curve, "removal_order.tif")
+need_file(template_path, "removal_order.tif template")
+template <- terra::rast(template_path)
+
+assert(length(alive0) == terra::ncell(template),
+       "Bundle alive_species_count_by_cell length does not match template ncell.")
+
+assert(length(cell_area_by_cell) == terra::ncell(template),
+       "Bundle cell_area_by_cell length does not match template ncell.")
+
+assert(all(is.finite(cell_area_by_cell[alive0]) & cell_area_by_cell[alive0] > 0),
+       "Some initially alive cells have missing/non-positive cell areas.")
+
+cell_area_raster <- terra::rast(template)
+terra::values(cell_area_raster) <- cell_area_by_cell
+names(cell_area_raster) <- "cell_area_km2"
+
+# Load and align rank map.
+rank <- terra::rast(rank_path)
+
+same_geom <- terra::compareGeom(rank, template, stopOnError = FALSE)
+
+if (!same_geom) {
+  assert(isTRUE(params$auto_align_rank),
+         "Rank map geometry differs from template and auto_align_rank is FALSE.")
+
+  cat("[rank] Aligning rank map to template with method = ",
+      params$rank_resample_method, "\n", sep = "")
+
+  rank <- terra::resample(
+    rank,
+    template,
+    method = as.character(params$rank_resample_method)
+  )
+}
+
+assert(terra::ncell(rank) == terra::ncell(template),
+       "Aligned rank map ncell does not match template.")
+
+cat("retained species:", nrow(sp), "\n")
+cat("stage_meta rows :", nrow(stage_meta), "\n")
+cat("alive0 cells    :", sum(alive0), "\n")
+cat("alive0 area km2 :", sum(cell_area_by_cell[alive0]), "\n\n")
+```
+
+---
+
+# Chunk 02 — build benchmark ranked-cell table and stage targets
+
+Purpose: turn the rank map into a deterministic ranked list of initially alive cells, then calculate the number of top-ranked benchmark cells to retain at each persistence-based stage.
+
+The comparison in the manuscript is at matched retained-area levels, so `match_basis: "area"` should be the default.
+
+```{r}
+# ============================================================
+# 02_rank_stage_targets — match benchmark rank map to stage_meta
+# ============================================================
+
+rank_values <- terra::values(rank, mat = FALSE)
+
+assert(length(rank_values) == terra::ncell(template),
+       "rank value vector length does not match template ncell.")
+
+rank_dt <- data.table(
+  cell = seq_along(rank_values),
+  rank_value = as.numeric(rank_values),
+  cell_area_km2 = cell_area_by_cell,
+  alive0 = alive0
+)
+
+rank_dt <- rank_dt[alive0 == TRUE]
+
+# Strong default: fail if any initially alive cell has a missing benchmark rank.
+# That prevents silent mismatch between the benchmark and the persistence run.
+missing_rank_n <- rank_dt[!is.finite(rank_value), .N]
+assert(missing_rank_n == 0L,
+       paste0("Benchmark rank map has missing/non-finite values for ",
+              missing_rank_n, " initially alive cells."))
+
+if (rank_higher_is_better) {
+  setorder(rank_dt, -rank_value, cell)
+} else {
+  setorder(rank_dt, rank_value, cell)
+}
+
+rank_dt[, cum_cells := seq_len(.N)]
+rank_dt[, cum_area_km2 := cumsum(cell_area_km2)]
+
+total_ranked_cells <- nrow(rank_dt)
+total_ranked_area <- rank_dt[.N, cum_area_km2]
+
+assert(total_ranked_cells == sum(alive0),
+       "Ranked alive-cell count does not equal bundle alive0 count.")
+
+# Select stages.
+available_stages <- sort(unique(stage_meta$stage))
+selected_stages <- parse_stage_selector(params$restrict_stages, available_stages)
+
+if (!include_stage0) {
+  selected_stages <- setdiff(selected_stages, 0L)
+}
+
+assert(length(selected_stages) > 0L,
+       "No stages selected for rank-map LUT reconstruction.")
+
+stage_targets <- stage_meta[stage %in% selected_stages]
+
+find_keep_n_by_area <- function(target_area, cum_area) {
+  if (!is.finite(target_area) || target_area <= 0) return(0L)
+
+  candidates <- c(0, cum_area)
+  as.integer(which.min(abs(candidates - target_area)) - 1L)
+}
+
+find_keep_n_by_cells <- function(target_cells, n_available) {
+  if (!is.finite(target_cells) || target_cells <= 0) return(0L)
+  as.integer(max(0L, min(n_available, round(target_cells))))
+}
+
+stage_targets[, keep_n := if (match_basis == "area") {
+  vapply(area_retained_km2, find_keep_n_by_area, integer(1),
+         cum_area = rank_dt$cum_area_km2)
+} else {
+  vapply(alive_end, find_keep_n_by_cells, integer(1),
+         n_available = total_ranked_cells)
+}]
+
+stage_targets[, actual_cells_retained := keep_n]
+stage_targets[, actual_area_retained_km2 := vapply(
+  keep_n,
+  function(k) {
+    if (is.finite(k) && k > 0L) rank_dt$cum_area_km2[k] else 0
+  },
+  numeric(1)
+)]
+
+stage_targets[, target_cells_retained := alive_end]
+stage_targets[, target_area_retained_km2 := area_retained_km2]
+
+stage_targets[, area_match_error_km2 :=
+                actual_area_retained_km2 - target_area_retained_km2]
+
+stage_targets[, abs_area_match_error_km2 := abs(area_match_error_km2)]
+
+stage_targets[, rank_cutoff := vapply(
+  keep_n,
+  function(k) {
+    if (is.finite(k) && k > 0L) rank_dt$rank_value[k] else NA_real_
+  },
+  numeric(1)
+)]
+
+# Stage 0 baseline should usually keep all cells.
+if (include_stage0 && 0L %in% stage_targets$stage) {
+  s0 <- stage_targets[stage == 0L]
+  assert(s0$keep_n == total_ranked_cells,
+         "Stage 0 target does not retain all initially alive cells. Check stage_meta or rank map.")
+}
+
+fwrite(stage_targets, target_summary_csv)
+cat("[targets] Wrote: ", target_summary_csv, "\n", sep = "")
+print(stage_targets[, .(
+  stage,
+  keep_n,
+  target_area_retained_km2,
+  actual_area_retained_km2,
+  area_match_error_km2,
+  rank_cutoff
+)])
+```
+
+---
+
+# Chunk 03 — spatial reconstruction helper functions
+
+Purpose: define the core worker function that takes a species and a set of retained benchmark cells, then returns a patch/PU lookup table.
+
+This is where you fold in the essential logic from old `7.3`: clump retained cells using rook adjacency, compute patch area, drop patches below `min_patch_size`, connect remaining patches within `dispersal_dist`, and drop connected population units below `min_pop_size`. These are the same patch and population-unit filtering rules used earlier in the workflow.
+
+```{r}
+# ============================================================
+# 03_reconstruction_helpers — clumping, area, connectivity, LUTs
+# ============================================================
+
+make_binary_raster_from_cells <- function(template, cells) {
+  r <- terra::rast(template)
+  terra::values(r) <- NA_integer_
+
+  if (length(cells)) {
+    r[cells] <- 1L
+  }
+
+  r
+}
+
+clump_rook <- function(binary_raster, backend = c("fasterRaster", "terra"), trim = TRUE) {
+  backend <- match.arg(backend)
+
+  r01 <- terra::ifel(!is.na(binary_raster) & binary_raster != 0, 1L, NA_integer_)
+
+  if (isTRUE(trim)) {
+    r01 <- tryCatch(
+      terra::trim(r01),
+      error = function(e) NULL
+    )
+  }
+
+  if (is.null(r01) || terra::ncell(r01) == 0L) {
+    return(NULL)
+  }
+
+  has_cells <- tryCatch({
+    as.numeric(terra::global(
+      terra::ifel(!is.na(r01), 1, 0),
+      "sum",
+      na.rm = TRUE
+    )[1, 1])
+  }, error = function(e) 0)
+
+  if (!is.finite(has_cells) || has_cells <= 0) {
+    return(NULL)
+  }
+
+  if (backend == "terra") {
+    cl <- terra::patches(r01, directions = 4, zeroAsNA = TRUE)
+  } else {
+    cl <- tryCatch({
+      terra::rast(
+        fasterRaster::clump(
+          fasterRaster::fast(r01),
+          diagonal = FALSE
+        )
+      )
+    }, error = function(e) {
+      stop("fasterRaster::clump failed.\nReason: ",
+           conditionMessage(e),
+           call. = FALSE)
+    })
+  }
+
+  # Defensive normalization: patch IDs must be positive integers, outside = NA.
+  cl <- terra::ifel(!is.na(cl) & cl > 0, cl, NA_integer_)
+  names(cl) <- "patch_id"
+
+  cl
+}
+
+
+patch_areas_from_clump <- function(clump_raster, cell_area_raster) {
+  if (is.null(clump_raster) || terra::ncell(clump_raster) == 0L) {
+    return(data.table(
+      patch_id = integer(),
+      patch_area_km2 = numeric(),
+      patch_n_cells = integer()
+    ))
+  }
+
+  # Crop/resample cell-area raster to the clump raster's extent/geometry.
+  ca <- terra::crop(cell_area_raster, clump_raster, snap = "out")
+
+  if (!terra::compareGeom(ca, clump_raster, stopOnError = FALSE)) {
+    ca <- terra::resample(ca, clump_raster, method = "near")
+  }
+
+  area_df <- as.data.frame(
+    terra::zonal(ca, clump_raster, "sum", na.rm = TRUE)
+  )
+
+  if (!nrow(area_df) || ncol(area_df) < 2L) {
+    return(data.table(
+      patch_id = integer(),
+      patch_area_km2 = numeric(),
+      patch_n_cells = integer()
+    ))
+  }
+
+  area_dt <- as.data.table(area_df)
+  setnames(area_dt, names(area_dt)[1:2], c("patch_id", "patch_area_km2"))
+
+  area_dt <- area_dt[
+    is.finite(patch_id) &
+      is.finite(patch_area_km2) &
+      patch_area_km2 > 0
+  ]
+
+  if (!nrow(area_dt)) {
+    return(data.table(
+      patch_id = integer(),
+      patch_area_km2 = numeric(),
+      patch_n_cells = integer()
+    ))
+  }
+  
+  freq_dt <- as.data.table(terra::freq(clump_raster, bylayer = FALSE))
+  
+  if (!nrow(freq_dt)) {
+    area_dt[, patch_n_cells := NA_integer_]
+    area_dt[, patch_id := as.integer(patch_id)]
+    return(area_dt[])
+  }
+  
+  assert(all(c("value", "count") %in% names(freq_dt)),
+         "Unexpected terra::freq() output schema.")
+
+  n_dt <- freq_dt[
+    is.finite(value),
+    .(
+      patch_id = as.integer(value),
+      patch_n_cells = as.integer(count)
+    )
+  ]
+
+  area_dt[, patch_id := as.integer(patch_id)]
+
+  out <- merge(area_dt, n_dt, by = "patch_id", all.x = TRUE)
+  out[is.na(patch_n_cells), patch_n_cells := NA_integer_]
+
+  out[]
+}
+
+polygonize_kept_patches <- function(clump_raster, keep_patch_ids) {
+  if (!length(keep_patch_ids)) return(NULL)
+
+  r <- terra::ifel(clump_raster %in% keep_patch_ids, clump_raster, NA)
+
+  pol <- terra::as.polygons(r, dissolve = TRUE, na.rm = TRUE)
+  if (is.null(pol) || terra::nrow(pol) == 0) return(NULL)
+
+  names(pol)[1] <- "patch_id"
+
+  sf::st_as_sf(pol)
+}
+
+assign_population_units <- function(patch_sf, patch_area_dt, disp_km, min_pop_km2) {
+  if (is.null(patch_sf) || !nrow(patch_sf)) {
+    return(data.table(patch_id = integer(), pu_id = integer()))
+  }
+
+  patch_sf$patch_id <- as.integer(patch_sf$patch_id)
+
+  # sf distance is in meters for lon/lat with s2; in CRS units otherwise.
+  # For implementation, verify CRS behavior once with your rasters.
+  patch_sf <- sf::st_make_valid(patch_sf)
+  
+  assert(is.finite(disp_km) && disp_km >= 0,
+       "disp_km must be finite and non-negative.")
+  
+  if (disp_km <= 0) {
+    pu_dt <- patch_area_dt[
+      patch_id %in% patch_sf$patch_id,
+      .(patch_id, patch_area_km2)
+    ]
+  
+    pu_dt <- pu_dt[patch_area_km2 >= min_pop_km2]
+  
+    if (!nrow(pu_dt)) {
+      return(data.table(patch_id = integer(), pu_id = integer()))
+    }
+  
+    pu_dt[, pu_id := seq_len(.N)]
+    return(pu_dt[, .(patch_id, pu_id)])
+  }
+  
+  is_longlat <- sf::st_is_longlat(patch_sf)
+
+  assert(!is.na(is_longlat),
+       "Patch polygons have missing CRS; distance-based PU linking cannot be evaluated safely.")
+  
+  if (is_longlat) {
+    old_s2 <- sf::sf_use_s2(TRUE)
+    on.exit(sf::sf_use_s2(old_s2), add = TRUE)
+    dist_arg <- units::set_units(disp_km, "km")
+  } else {
+    dist_arg <- units::set_units(disp_km * 1000, "m")
+  }
+  
+  neighbors <- sf::st_is_within_distance(
+    patch_sf,
+    patch_sf,
+    dist = dist_arg
+  )
+
+  edge_list <- lapply(seq_along(neighbors), function(i) {
+    j <- as.integer(neighbors[[i]])
+    j <- j[j > i]
+    if (!length(j)) return(NULL)
+    data.table(from = i, to = j)
+  })
+  
+  edge_list <- Filter(Negate(is.null), edge_list)
+  
+  edge_dt <- if (length(edge_list)) {
+    rbindlist(edge_list, use.names = TRUE)
+  } else {
+    data.table(from = integer(), to = integer())
+  }
+
+  g <- igraph::make_empty_graph(n = nrow(patch_sf), directed = FALSE)
+  
+  if (nrow(edge_dt)) {
+    g <- igraph::add_edges(g, as.vector(t(as.matrix(edge_dt[, .(from, to)]))))
+  }
+
+  comp <- igraph::components(g)$membership
+
+  pu_dt <- data.table(
+    patch_id = patch_sf$patch_id,
+    pu_tmp = as.integer(comp)
+  )
+
+  pu_dt <- merge(
+    pu_dt,
+    patch_area_dt[, .(patch_id, patch_area_km2)],
+    by = "patch_id",
+    all.x = TRUE
+  )
+
+  pu_area <- pu_dt[, .(
+    pu_area_km2 = sum(patch_area_km2, na.rm = TRUE)
+  ), by = pu_tmp]
+
+  keep_tmp <- pu_area[pu_area_km2 >= min_pop_km2, pu_tmp]
+
+  pu_dt <- pu_dt[pu_tmp %in% keep_tmp]
+
+  if (!nrow(pu_dt)) {
+    return(data.table(patch_id = integer(), pu_id = integer()))
+  }
+
+  pu_map <- data.table(
+    pu_tmp = sort(unique(pu_dt$pu_tmp)),
+    pu_id = seq_along(sort(unique(pu_dt$pu_tmp)))
+  )
+
+  merge(pu_dt[, .(patch_id, pu_tmp)], pu_map, by = "pu_tmp")[, .(patch_id, pu_id)]
+}
+
+build_lut_one_species <- function(
+  sci,
+  sp_id,
+  retained_species_cells,
+  min_patch_km2,
+  min_pop_km2,
+  disp_km,
+  template,
+  cell_area_raster,
+  clump_backend
+) {
+  retained_species_cells <- as.integer(retained_species_cells)
+
+  if (!length(retained_species_cells)) {
+    return(list(
+      n_retained_cells = 0L,
+      lut = empty_lut()
+    ))
+  }
+
+  binary <- make_binary_raster_from_cells(template, retained_species_cells)
+
+  clumped <- clump_rook(binary, backend = clump_backend)
+
+  if (is.null(clumped)) {
+    return(list(
+      n_retained_cells = length(retained_species_cells),
+      lut = empty_lut()
+    ))
+  }
+
+  patch_area_dt <- patch_areas_from_clump(clumped, cell_area_raster)
+
+  patch_area_dt <- patch_area_dt[patch_area_km2 >= min_patch_km2]
+
+  if (!nrow(patch_area_dt)) {
+    return(list(
+      n_retained_cells = length(retained_species_cells),
+      lut = empty_lut()
+    ))
+  }
+
+  patch_sf <- polygonize_kept_patches(clumped, patch_area_dt$patch_id)
+
+  pu_dt <- assign_population_units(
+    patch_sf = patch_sf,
+    patch_area_dt = patch_area_dt,
+    disp_km = disp_km,
+    min_pop_km2 = min_pop_km2
+  )
+
+  if (!nrow(pu_dt)) {
+    return(list(
+      n_retained_cells = length(retained_species_cells),
+      lut = empty_lut()
+    ))
+  }
+
+  out <- merge(
+    patch_area_dt,
+    pu_dt,
+    by = "patch_id",
+    all = FALSE
+  )
+
+  setorder(out, pu_id, patch_id)
+
+  out[, patch_id := seq_len(.N)]
+
+  out[, `:=`(
+    stage = NA_integer_,
+    method = "rank",
+    scientificName = sci,
+    species = sp_id
+  )]
+
+  setcolorder(out, c(
+    "stage",
+    "method",
+    "scientificName",
+    "species",
+    "patch_id",
+    "pu_id",
+    "patch_area_km2",
+    "patch_n_cells"
+  ))
+
+  list(
+    n_retained_cells = length(retained_species_cells),
+    lut = out[]
+  )
+}
+```
+
+---
+
+# Chunk 04 — species cell cache
+
+Purpose: avoid repeatedly reading full patch rasters if the optimized script-6 bundle already contains species cell-index lists.
+
+The optimized priority input bundle should be preferred here. If it contains `patch_cell_index_by_species_list`, use that. If not, fall back to reading each species patch raster once.
+
+```{r}
+# ============================================================
+# 04_species_cell_cache — initial habitat cells by species
+# ============================================================
+
+get_species_cells_from_patch_raster <- function(path) {
+  r <- terra::rast(path)
+  vals <- terra::values(r, mat = FALSE)
+  which(is.finite(vals) & vals > 0)
+}
+
+species_cells <- vector("list", nrow(sp))
+names(species_cells) <- sp$scientificName
+
+if (!is.null(bundle$patch_cell_index_by_species_list)) {
+  cat("[species_cells] Using bundle$patch_cell_index_by_species_list where possible.\n")
+
+  for (i in seq_len(nrow(sp))) {
+    sci <- sp$scientificName[i]
+
+    x <- bundle$patch_cell_index_by_species_list[[sci]]
+
+    if (is.null(x)) {
+      # Fallback in case names are species IDs rather than scientific names.
+      x <- bundle$patch_cell_index_by_species_list[[sid(sci)]]
+    }
+
+    if (is.null(x)) {
+      species_cells[[sci]] <- get_species_cells_from_patch_raster(sp$patch_path[i])
+    } else {
+      if (is.list(x) && !is.null(x$cell)) {
+        cells <- x$cell
+      } else if (is.data.frame(x) && "cell" %in% names(x)) {
+        cells <- x$cell
+      } else {
+        cells <- x
+      }
+    
+      species_cells[[sci]] <- sort(unique(as.integer(cells)))
+    }
+  }
+
+} else {
+  cat("[species_cells] Bundle has no patch_cell_index_by_species_list; reading patch rasters.\n")
+
+  for (i in seq_len(nrow(sp))) {
+    species_cells[[sp$scientificName[i]]] <- get_species_cells_from_patch_raster(sp$patch_path[i])
+  }
+}
+
+cell_counts <- vapply(species_cells, length, integer(1))
+assert(all(cell_counts > 0),
+       "At least one retained species has zero initial patch cells.")
+
+cat("[species_cells] Cached species cell vectors for ", length(species_cells), " species.\n", sep = "")
+summary(cell_counts)
+
+n_template_cells <- terra::ncell(template)
+
+bad_species_cells <- names(which(vapply(
+  species_cells,
+  function(x) {
+    any(!is.finite(x) | x < 1L | x > n_template_cells)
+  },
+  logical(1)
+)))
+
+assert(!length(bad_species_cells),
+       paste("Some species cell vectors contain invalid cell indices:",
+             paste(bad_species_cells, collapse = ", ")))
+
+bad_outside_alive0 <- names(which(vapply(
+  species_cells,
+  function(x) {
+    any(!alive0[x])
+  },
+  logical(1)
+)))
+
+assert(!length(bad_outside_alive0),
+       paste("Some species cell vectors include cells outside the initial alive0 domain:",
+             paste(bad_outside_alive0, collapse = ", ")))
+```
+
+---
+
+# Chunk 05 — write baseline stage 0 LUT
+
+Purpose: save `lut_stage_0000.rds`.
+
+For stage 0, do **not** rebuild from the benchmark rank map. The baseline landscape is shared by both methods, so use the initial patch table from the bundle. This avoids unnecessary reclumping and guarantees that both methods start from the same spatial state.
+
+```{r}
+# ============================================================
+# 05_stage0_lut — shared baseline
+# ============================================================
+
+baseline_lut_path <- file.path(lut_root, sprintf("%s%04d.rds", lut_prefix, 0L))
+
+baseline_lut <- NULL
+
+if (include_stage0 && (overwrite || !file.exists(baseline_lut_path))) {
+  baseline_lut <- as.data.table(bundle$patch_table)
+  
+  if (!"scientificName" %in% names(baseline_lut)) {
+    if ("species" %in% names(baseline_lut)) {
+      baseline_lut[, scientificName := as.character(species)]
+    } else {
+      stop("bundle$patch_table must contain either scientificName or species.", call. = FALSE)
+    }
+  }
+  
+  required_lut_cols <- c("scientificName", "patch_id", "pu_id", "patch_area_km2")
+  missing_lut_cols <- setdiff(required_lut_cols, names(baseline_lut))
+  assert(!length(missing_lut_cols),
+         paste("bundle$patch_table is missing column(s):",
+               paste(missing_lut_cols, collapse = ", ")))
+
+  baseline_lut <- baseline_lut[scientificName %in% retained_species]
+
+  baseline_lut[, species := sid(scientificName)]
+  baseline_lut[, stage := 0L]
+  baseline_lut[, method := "rank"]
+
+  if (!"patch_n_cells" %in% names(baseline_lut)) {
+    baseline_lut[, patch_n_cells := NA_integer_]
+  }
+
+  baseline_lut <- baseline_lut[, .(
+    stage,
+    method,
+    scientificName,
+    species,
+    patch_id = as.integer(patch_id),
+    pu_id = as.integer(pu_id),
+    patch_area_km2 = as.numeric(patch_area_km2),
+    patch_n_cells = as.integer(patch_n_cells)
+  )]
+
+  saveRDS(baseline_lut, baseline_lut_path)
+
+  cat("[stage0] Wrote: ", baseline_lut_path, "\n", sep = "")
+
+} else if (include_stage0) {
+  cat("[stage0] Exists -> skipping: ", baseline_lut_path, "\n", sep = "")
+}
+```
+
+---
+
+# Chunk 06 — build rank-map LUTs for stages 1+
+
+Purpose: for each selected stage, identify top-ranked benchmark cells to keep, rebuild patch/PU lookup tables for all species, and save `lut_stage_####.rds`.
+
+This is the direct replacement for old `7.2` + `7.3`.
+
+```{r}
+# ============================================================
+# 06_build_stage_luts — direct rank-map retained landscape -> LUTs
+# ============================================================
+
+# Exclude stage 0 here; it was handled above.
+build_targets <- stage_targets[stage != 0L]
+if (nrow(build_targets) > 1L) {
+  assert(all(diff(build_targets$keep_n) <= 0),
+         "Rank-map keep_n should be non-increasing across increasing stages.")
+}
+setorder(build_targets, stage)
+
+# Species-level monotone cache.
+prev_n_cells <- setNames(rep(NA_integer_, nrow(sp)), sp$scientificName)
+prev_lut <- setNames(vector("list", nrow(sp)), sp$scientificName)
+for (nm in names(prev_lut)) prev_lut[[nm]] <- empty_lut()
+
+inventory <- list()
+
+rank_cells_sorted <- as.integer(rank_dt$cell)
+n_template_cells <- terra::ncell(template)
+
+retained_mask <- rep(FALSE, n_template_cells)
+current_keep_n <- 0L
+
+update_retained_mask <- function(next_keep_n) {
+  next_keep_n <- as.integer(next_keep_n)
+
+  assert(is.finite(next_keep_n) &&
+           next_keep_n >= 0L &&
+           next_keep_n <= length(rank_cells_sorted),
+         "Invalid keep_n while updating retained mask.")
+
+  if (next_keep_n > current_keep_n) {
+    idx <- seq.int(current_keep_n + 1L, next_keep_n)
+    retained_mask[rank_cells_sorted[idx]] <<- TRUE
+
+  } else if (next_keep_n < current_keep_n) {
+    idx <- seq.int(next_keep_n + 1L, current_keep_n)
+    retained_mask[rank_cells_sorted[idx]] <<- FALSE
+  }
+
+  current_keep_n <<- next_keep_n
+
+  invisible(NULL)
+}
+
+for (rr in seq_len(nrow(build_targets))) {
+  s <- as.integer(build_targets$stage[rr])
+  keep_n <- as.integer(build_targets$keep_n[rr])
+
+  out_path <- file.path(lut_root, sprintf("%s%04d.rds", lut_prefix, s))
+
+  if (file.exists(out_path) && !overwrite) {
+    cat("[stage ", s, "] Exists -> skipping: ", out_path, "\n", sep = "")
+
+    lut_existing <- readRDS(out_path)
+
+    inventory[[length(inventory) + 1L]] <- data.table(
+      stage = s,
+      lut_path = out_path,
+      skipped_existing = TRUE,
+      lut_rows = nrow(lut_existing),
+      species_with_units = uniqueN(lut_existing$scientificName),
+      target_area_retained_km2 = build_targets$target_area_retained_km2[rr],
+      actual_area_retained_km2 = build_targets$actual_area_retained_km2[rr],
+      area_match_error_km2 = build_targets$area_match_error_km2[rr]
+    )
+
+    next
+  }
+
+  cat("\n[stage ", s, "] Building rank-map LUT; keep_n = ", keep_n, "\n", sep = "")
+
+  update_retained_mask(keep_n)
+
+  stage_luts <- vector("list", nrow(sp))
+
+  for (i in seq_len(nrow(sp))) {
+    sci <- sp$scientificName[i]
+    sp_id <- sp$species[i]
+    
+    cat("[stage ", s, "] Processing species ", i, "/", nrow(sp), ": ", sci, "\n", sep = "")
+    
+    cells_i <- species_cells[[sci]]
+    retained_species_cells <- cells_i[retained_mask[cells_i]]
+    species_retained_n <- length(retained_species_cells)
+
+    if (
+      use_monotone_cache &&
+      is.finite(prev_n_cells[[sci]]) &&
+      identical(as.integer(prev_n_cells[[sci]]), as.integer(species_retained_n))
+    ) {
+      stage_luts[[i]] <- copy(prev_lut[[sci]])
+      if (nrow(stage_luts[[i]])) stage_luts[[i]][, stage := s]
+      next
+    }
+
+    res <- build_lut_one_species(
+      sci = sci,
+      sp_id = sp_id,
+      retained_species_cells = retained_species_cells,
+      min_patch_km2 = as.numeric(sp$min_patch_size[i]),
+      min_pop_km2 = as.numeric(sp$min_pop_size[i]),
+      disp_km = as.numeric(sp$dispersal_dist[i]),
+      template = template,
+      cell_area_raster = cell_area_raster,
+      clump_backend = clump_backend
+    )
+
+    lut_i <- res$lut
+    if (nrow(lut_i)) lut_i[, stage := s]
+
+    stage_luts[[i]] <- lut_i
+
+    prev_n_cells[[sci]] <- as.integer(res$n_retained_cells)
+    prev_lut[[sci]] <- copy(lut_i)
+  }
+
+  stage_lut <- rbindlist(stage_luts, use.names = TRUE, fill = TRUE)
+
+  if (!nrow(stage_lut)) {
+    stage_lut <- empty_lut()
+  }
+
+  saveRDS(stage_lut, out_path)
+
+  inventory[[length(inventory) + 1L]] <- data.table(
+    stage = s,
+    lut_path = out_path,
+    skipped_existing = FALSE,
+    lut_rows = nrow(stage_lut),
+    species_with_units = uniqueN(stage_lut$scientificName),
+    target_area_retained_km2 = build_targets$target_area_retained_km2[rr],
+    actual_area_retained_km2 = build_targets$actual_area_retained_km2[rr],
+    area_match_error_km2 = build_targets$area_match_error_km2[rr]
+  )
+
+  cat("[stage ", s, "] Wrote: ", out_path, " rows=", nrow(stage_lut), "\n", sep = "")
+
+  rm(stage_luts, stage_lut)
+  gc(FALSE)
+}
+```
+
+---
+
+# Chunk 07 — verify outputs and write inventory
+
+Purpose: confirm that every selected stage has a LUT and that the tables have the expected schema.
+
+```{r}
+# ============================================================
+# 07_verify_inventory — output checks
+# ============================================================
+
+expected_lut_stages <- selected_stages
+expected_lut_paths <- file.path(
+  lut_root,
+  sprintf("%s%04d.rds", lut_prefix, expected_lut_stages)
+)
+
+missing_lut_paths <- expected_lut_paths[!file.exists(expected_lut_paths)]
+assert(!length(missing_lut_paths),
+       paste("Missing expected LUT file(s):",
+             paste(missing_lut_paths, collapse = "\n")))
+
+verify_one_lut <- function(path) {
+  x <- readRDS(path)
+
+  required <- c(
+    "stage",
+    "method",
+    "scientificName",
+    "species",
+    "patch_id",
+    "pu_id",
+    "patch_area_km2"
+  )
+
+  missing <- setdiff(required, names(x))
+  assert(!length(missing),
+         paste("LUT is missing column(s):", paste(missing, collapse = ", "),
+               "\nPath:", path))
+
+  data.table(
+    path = path,
+    stage = as.integer(sub(
+      paste0("^.*", lut_prefix, "([0-9]{4})\\.rds$"),
+      "\\1",
+      basename(path)
+    )),
+    n_rows = nrow(x),
+    n_species = if ("scientificName" %in% names(x)) uniqueN(x$scientificName) else 0L,
+    n_pu = if ("pu_id" %in% names(x)) uniqueN(paste(x$scientificName, x$pu_id)) else 0L,
+    total_patch_area_km2 = if ("patch_area_km2" %in% names(x)) {
+      sum(x$patch_area_km2, na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+  )
+}
+
+verify_dt <- rbindlist(lapply(expected_lut_paths, verify_one_lut))
+
+# Merge target info for readable QA.
+verify_dt <- merge(
+  verify_dt,
+  stage_targets[, .(
+    stage,
+    target_area_retained_km2,
+    actual_area_retained_km2,
+    area_match_error_km2,
+    keep_n,
+    rank_cutoff
+  )],
+  by = "stage",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+setorder(verify_dt, stage)
+
+fwrite(verify_dt, inventory_csv)
+
+cat("[inventory] Wrote: ", inventory_csv, "\n", sep = "")
+print(verify_dt)
+```
