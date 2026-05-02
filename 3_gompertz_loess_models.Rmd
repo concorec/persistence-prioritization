@@ -50,7 +50,7 @@ CURVES <- c("q50", "q16", "q025")
 K0     <- 500        # fixed shift (must remain exactly 500)
 
 # LOESS smoothing constants (single source of truth; used for saved models + LOESS figures)
-SPAN_LOESS <- 0.8
+SPAN_LOESS <- 0.75
 Z_LOESS    <- 1.96  # ~95% interval from LOESS SE
 
 # Only persisted artifact from this Rmd (required downstream)

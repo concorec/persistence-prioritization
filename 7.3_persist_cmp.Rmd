@@ -1,0 +1,1682 @@
+
+
+---
+title: "7.3_persist_cmp"
+output: html_document
+params:
+  # ---- run identity ----
+  curve: "q025"
+
+  # ---- optimized script-6 / 7.1 / 7.2 inputs ----
+  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc_remove_1000_k_100"
+  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc.rds"
+
+  species_csv: "Data/Clean/species_table.csv"
+
+  ana_subdir: "ana"
+  stage_meta_name: "stage_meta.csv"
+
+  pipe_patch_lookup_dir: "patch_lookup_tables"
+  pipe_patch_lookup_prefix: "stage_patch_lookup_stage_"
+
+  rank_lut_dir: "rank_lut_abf"
+  rank_lut_prefix: "lut_stage_"
+
+  # "" = all stages in stage_meta; otherwise e.g. "0:20" or "0,1,2,10"
+  restrict_stages: ""
+
+  # ---- persistence curve selector ----
+  stop_if_missing_gompertz: true
+
+  # ---- x-axis metadata copied into outputs ----
+  x_axis: "pct_removed"   # "pct_removed" or "stage"
+
+  # ---- outputs, under pipeline_output_dir/ana/persist_cmp/ ----
+  out_subdir: "persist_cmp_abf"
+  pu_long_name: "pu_long_abf.csv"
+  sp_long_name: "sp_long_abf.csv"
+  stage_sum_name: "stage_sum_abf.csv"
+  stage_compare_name: "stage_compare_abf.csv"
+
+  overwrite: true
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+# ============================================================
+# 00_setup — helpers, paths, input validation
+# ============================================================
+
+assert <- function(ok, msg) {
+  if (!isTRUE(ok)) stop(msg, call. = FALSE)
+}
+
+need_file <- function(p, label = p) {
+  assert(file.exists(p), paste0("Missing file: ", label, "\nPath: ", p))
+}
+
+need_dir <- function(p, label = p) {
+  assert(dir.exists(p), paste0("Missing dir: ", label, "\nPath: ", p))
+}
+
+sid <- function(scientific_name) {
+  x <- trimws(as.character(scientific_name))
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[/\\\\:<>\"|?*]+", "_", x)
+  x <- gsub("[^A-Za-z0-9_]+", "_", x)
+  x <- gsub("_+", "_", x)
+  gsub("^_|_$", "", x)
+}
+
+stagetag <- function(x) sprintf("%04d", as.integer(x))
+
+parse_stage_selector <- function(x, available_stages) {
+  x <- trimws(as.character(x))
+
+  if (!nzchar(x)) {
+    return(sort(unique(available_stages)))
+  }
+
+  if (grepl("^\\d+\\s*:\\s*\\d+$", x)) {
+    z <- as.integer(strsplit(gsub("\\s+", "", x), ":")[[1]])
+    return(intersect(seq(z[1], z[2]), available_stages))
+  }
+
+  nums <- as.integer(unlist(regmatches(x, gregexpr("\\d+", x))))
+  intersect(nums, available_stages)
+}
+
+empty_norm_lut <- function() {
+  data.table(
+    method = character(),
+    stage = integer(),
+    scientificName = character(),
+    species = character(),
+    patch_id = integer(),
+    pu_id = integer(),
+    patch_area_km2 = numeric()
+  )
+}
+
+# ============================================================
+# Parameters
+# ============================================================
+
+curve <- as.character(params$curve)
+assert(curve %in% c("q50", "q16", "q025"),
+       "params$curve must be one of: q50, q16, q025.")
+
+overwrite <- isTRUE(params$overwrite)
+
+x_axis <- as.character(params$x_axis)
+assert(x_axis %in% c("pct_removed", "stage"),
+       "params$x_axis must be 'pct_removed' or 'stage'.")
+
+# ============================================================
+# Paths
+# ============================================================
+
+out_curve <- as.character(params$pipeline_output_dir)
+bundle_path <- as.character(params$pruning_input_bundle_path)
+species_csv <- as.character(params$species_csv)
+
+ana <- file.path(out_curve, as.character(params$ana_subdir))
+stage_meta_csv <- file.path(ana, as.character(params$stage_meta_name))
+
+pipe_lookup_dir <- file.path(out_curve, as.character(params$pipe_patch_lookup_dir))
+pipe_prefix <- as.character(params$pipe_patch_lookup_prefix)
+
+rank_lut_root <- file.path(ana, as.character(params$rank_lut_dir))
+rank_prefix <- as.character(params$rank_lut_prefix)
+
+out_root <- file.path(ana, as.character(params$out_subdir))
+dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+
+out_pu <- file.path(out_root, as.character(params$pu_long_name))
+out_sp <- file.path(out_root, as.character(params$sp_long_name))
+out_stage <- file.path(out_root, as.character(params$stage_sum_name))
+out_compare <- file.path(out_root, as.character(params$stage_compare_name))
+
+need_dir(out_curve, "pipeline_output_dir")
+need_file(bundle_path, "pruning input bundle")
+need_file(species_csv, "species_table.csv")
+need_file(stage_meta_csv, "stage_meta.csv from 7.1")
+need_dir(pipe_lookup_dir, "optimized script-6 patch_lookup_tables")
+need_dir(rank_lut_root, "rank-map LUT output from 7.2")
+need_dir(out_root, "persist_cmp output directory")
+
+# ============================================================
+# Load bundle and stage metadata
+# ============================================================
+
+bundle <- readRDS(bundle_path)
+
+required_bundle_fields <- c("metadata", "patch_table")
+missing_bundle_fields <- setdiff(required_bundle_fields, names(bundle))
+assert(!length(missing_bundle_fields),
+       paste("Bundle is missing field(s):",
+             paste(missing_bundle_fields, collapse = ", ")))
+
+assert(!is.null(bundle$metadata$retained_species),
+       "Bundle metadata is missing retained_species.")
+
+retained_species <- as.character(bundle$metadata$retained_species)
+
+stage_meta <- fread(stage_meta_csv)
+
+required_stage_cols <- c(
+  "stage",
+  "alive_end",
+  "area_retained_km2",
+  "prop_area_removed_end",
+  "pct_removed_end"
+)
+
+missing_stage_cols <- setdiff(required_stage_cols, names(stage_meta))
+assert(!length(missing_stage_cols),
+       paste("stage_meta.csv is missing column(s):",
+             paste(missing_stage_cols, collapse = ", ")))
+
+assert(stage_meta[stage == 0L, .N] == 1L,
+       "stage_meta.csv must contain exactly one stage 0 row.")
+
+stage_meta[, stage := as.integer(stage)]
+setorder(stage_meta, stage)
+
+available_stages <- sort(unique(stage_meta$stage))
+selected_stages <- parse_stage_selector(params$restrict_stages, available_stages)
+
+assert(length(selected_stages) > 0L,
+       "No stages selected. Check params$restrict_stages.")
+
+stage_meta <- stage_meta[stage %in% selected_stages]
+setorder(stage_meta, stage)
+
+stage_meta[, stage_order := seq_len(.N) - 1L]
+
+if (x_axis == "pct_removed") {
+  stage_meta[, x := as.numeric(pct_removed_end)]
+} else {
+  stage_meta[, x := as.numeric(stage)]
+}
+
+assert(all(is.finite(stage_meta$x)),
+       "Selected stage metadata has non-finite x values.")
+
+# ============================================================
+# Load species parameters
+# ============================================================
+
+a_col <- paste0("alpha_", curve)
+b_col <- paste0("beta_", curve)
+
+species_header <- names(fread(species_csv, nrows = 0))
+
+required_species_cols <- c(
+  "scientificName",
+  "className",
+  "density",
+  "min_pop_size",
+  a_col,
+  b_col
+)
+
+missing_species_cols <- setdiff(required_species_cols, species_header)
+assert(!length(missing_species_cols),
+       paste("species_table.csv is missing column(s):",
+             paste(missing_species_cols, collapse = ", ")))
+
+sp0 <- fread(species_csv, select = required_species_cols)
+
+sp0[, scientificName := trimws(as.character(scientificName))]
+sp0 <- sp0[scientificName %in% retained_species]
+
+assert(nrow(sp0) == length(retained_species),
+       paste0(
+         "species_table.csv does not contain exactly the retained species from the bundle. ",
+         "Expected ", length(retained_species), ", got ", nrow(sp0), "."
+       ))
+
+sp0[, species := sid(scientificName)]
+
+sp0[, density := suppressWarnings(as.numeric(density))]
+sp0[, c_th := suppressWarnings(as.numeric(min_pop_size))]
+sp0[, a_pred := suppressWarnings(as.numeric(get(a_col)))]
+sp0[, b_pred := suppressWarnings(as.numeric(get(b_col)))]
+sp0[, className := as.character(className)]
+
+bad_species <- sp0[
+  !is.finite(density) | density <= 0 |
+    !is.finite(c_th) | c_th <= 0 |
+    !is.finite(a_pred) | a_pred <= 0 |
+    !is.finite(b_pred) | b_pred <= 0
+]
+
+if (nrow(bad_species)) {
+  msg <- paste0(
+    "Found ", nrow(bad_species),
+    " species with invalid density/min_pop_size/Gompertz parameters."
+  )
+
+  if (isTRUE(params$stop_if_missing_gompertz)) {
+    stop(msg, call. = FALSE)
+  } else {
+    warning(msg)
+    sp0 <- sp0[!scientificName %in% bad_species$scientificName]
+  }
+}
+
+assert(nrow(sp0) > 0L,
+       "No valid retained species remain after filtering invalid parameters.")
+
+par <- sp0[, .(
+  scientificName,
+  species,
+  className,
+  density,
+  a_pred,
+  b_pred,
+  c_th
+)]
+
+assert(anyDuplicated(par$species) == 0L,
+       "Duplicate species IDs after sid(scientificName).")
+
+setkey(par, species)
+
+cat("\n=== 7.3_persist_cmp ===\n")
+cat("curve              :", curve, "\n")
+cat("pipeline_output_dir:", out_curve, "\n")
+cat("ana                :", ana, "\n")
+cat("selected stages    :", length(selected_stages), "\n")
+cat("retained species   :", nrow(par), "\n")
+cat("x_axis             :", x_axis, "\n")
+cat("out_root           :", out_root, "\n\n")
+```
+
+---
+
+## Chunk 01 — discover method-specific LUT paths
+
+```{r}
+# ============================================================
+# 01_discover_method_inputs
+#
+# Persistence-based method:
+#   stage 0: bundle$patch_table
+#   stage >0: optimized script-6 patch_lookup_tables/stage_patch_lookup_stage_####.csv
+#
+# Rank-map benchmark:
+#   stage >=0: 7.2 ana/rank_lut/lut_stage_####.rds
+# ============================================================
+
+pipe_stage_path <- function(stage) {
+  stage <- as.integer(stage)
+
+  if (stage == 0L) {
+    return(NA_character_)
+  }
+
+  # Prefer the exact path recorded by 7.1 stage_meta if present.
+  if ("patch_lookup_path" %in% names(stage_meta)) {
+    p <- stage_meta[stage == !!stage, patch_lookup_path][1]
+    if (!is.na(p) && nzchar(p) && file.exists(p)) {
+      return(p)
+    }
+  }
+
+  file.path(
+    pipe_lookup_dir,
+    sprintf("%s%04d.csv", pipe_prefix, stage)
+  )
+}
+
+rank_stage_path <- function(stage) {
+  file.path(
+    rank_lut_root,
+    sprintf("%s%04d.rds", rank_prefix, as.integer(stage))
+  )
+}
+
+pipe_st <- copy(stage_meta)[
+  ,
+  .(
+    method = "pipe",
+    stage,
+    stage_order,
+    x,
+    path = vapply(stage, pipe_stage_path, character(1))
+  )
+]
+
+rank_st <- copy(stage_meta)[
+  ,
+  .(
+    method = "rank",
+    stage,
+    stage_order,
+    x,
+    path = vapply(stage, rank_stage_path, character(1))
+  )
+]
+
+missing_pipe <- pipe_st[stage != 0L & !file.exists(path)]
+assert(nrow(missing_pipe) == 0L,
+       paste("Missing persistence-based stage patch lookup file(s):",
+             paste(missing_pipe$path, collapse = "\n")))
+
+missing_rank <- rank_st[!file.exists(path)]
+assert(nrow(missing_rank) == 0L,
+       paste("Missing rank-map LUT file(s) from 7.2:",
+             paste(missing_rank$path, collapse = "\n")))
+
+cat("[inputs] Persistence-based stages:", nrow(pipe_st), "\n")
+cat("[inputs] Rank-map stages         :", nrow(rank_st), "\n")
+```
+
+---
+
+## Chunk 02 — LUT standardization and persistence functions
+
+```{r}
+# ============================================================
+# 02_persistence_helpers
+# ============================================================
+
+standardize_lut <- function(x, method, stage, par) {
+  dt <- as.data.table(x)
+
+  if (!nrow(dt)) {
+    return(empty_norm_lut())
+  }
+
+  if (!"scientificName" %in% names(dt)) {
+    assert("species" %in% names(dt),
+           "LUT must contain either scientificName or species.")
+
+    species_raw <- as.character(dt$species)
+
+    if (all(species_raw %in% par$scientificName)) {
+      dt[, scientificName := species_raw]
+    } else if (all(species_raw %in% par$species)) {
+      map <- par[, .(species, scientificName)]
+      dt[, species := species_raw]
+      dt <- merge(dt, map, by = "species", all.x = TRUE, sort = FALSE)
+      assert(all(!is.na(dt$scientificName)),
+             "Could not map all species IDs in LUT to scientificName.")
+    } else {
+      stop(
+        "LUT species column is neither scientific names nor sid(scientificName) IDs.",
+        call. = FALSE
+      )
+    }
+  }
+
+  assert("pu_id" %in% names(dt),
+         "LUT is missing pu_id.")
+
+  assert("patch_area_km2" %in% names(dt),
+         "LUT is missing patch_area_km2.")
+
+  if (!"patch_id" %in% names(dt)) {
+    dt[, patch_id := seq_len(.N)]
+  }
+
+  dt[, scientificName := trimws(as.character(scientificName))]
+  dt[, species := sid(scientificName)]
+
+  dt <- dt[species %in% par$species]
+
+  if (!nrow(dt)) {
+    return(empty_norm_lut())
+  }
+
+  dt[, patch_id := as.integer(patch_id)]
+  dt[, pu_id := as.integer(pu_id)]
+  dt[, patch_area_km2 := as.numeric(patch_area_km2)]
+
+  bad <- dt[
+    !is.finite(pu_id) |
+      !is.finite(patch_area_km2) |
+      patch_area_km2 <= 0
+  ]
+
+  assert(nrow(bad) == 0L,
+         paste0("LUT for method=", method, ", stage=", stage,
+                " contains invalid pu_id or patch_area_km2."))
+
+  out <- dt[, .(
+    method = as.character(method),
+    stage = as.integer(stage),
+    scientificName,
+    species,
+    patch_id,
+    pu_id,
+    patch_area_km2
+  )]
+
+  out[]
+}
+
+load_pipe_lut <- function(stage, path) {
+  stage <- as.integer(stage)
+
+  if (stage == 0L) {
+    return(standardize_lut(
+      x = bundle$patch_table,
+      method = "pipe",
+      stage = 0L,
+      par = par
+    ))
+  }
+
+  standardize_lut(
+    x = fread(path),
+    method = "pipe",
+    stage = stage,
+    par = par
+  )
+}
+
+load_rank_lut <- function(stage, path) {
+  standardize_lut(
+    x = readRDS(path),
+    method = "rank",
+    stage = as.integer(stage),
+    par = par
+  )
+}
+
+# PU-level persistence probability.
+# The curve is P(K) = exp[-alpha * (K - 500)^(-beta)].
+# Since K = density * area and c_th = 500 / density,
+# this is equivalent to:
+# P(A) = exp[-alpha * density^(-beta) * (A - c_th)^(-beta)].
+pu_persist <- function(area_km2, density, a_pred, b_pred, c_th) {
+  A <- as.numeric(area_km2)
+  dens <- as.numeric(density)
+  a <- as.numeric(a_pred)
+  b <- as.numeric(b_pred)
+  c <- as.numeric(c_th)
+
+  delta <- A - c
+  out <- numeric(length(A))
+
+  ok <- is.finite(delta) & delta > 0 &
+    is.finite(dens) & dens > 0 &
+    is.finite(a) & a > 0 &
+    is.finite(b) & b > 0
+
+  out[!ok] <- 0
+
+  if (any(ok)) {
+    log_inner <- log(a[ok]) -
+      b[ok] * log(dens[ok]) -
+      b[ok] * log(delta[ok])
+
+    inner <- exp(log_inner)
+    out[ok] <- exp(-inner)
+  }
+
+  out[!is.finite(out)] <- 0
+  out[out < 0] <- 0
+  out[out > 1] <- 1
+
+  out
+}
+
+sp_persist <- function(P_pu) {
+  P <- as.numeric(P_pu)
+  P <- P[is.finite(P)]
+
+  if (!length(P)) return(0)
+
+  P <- pmin(pmax(P, 0), 1)
+
+  if (any(P >= 1)) return(1)
+
+  log_ext <- sum(log1p(-P))
+  S <- 1 - exp(log_ext)
+
+  if (!is.finite(S)) S <- 0
+
+  min(max(S, 0), 1)
+}
+```
+
+---
+
+## Chunk 03 — compute one method
+
+```{r}
+# ============================================================
+# 03_compute_method
+# ============================================================
+
+compute_method <- function(stage_table, method, load_fn, par) {
+  pu_list <- vector("list", nrow(stage_table))
+  sp_list <- vector("list", nrow(stage_table))
+
+  par_small <- par[, .(
+    scientificName,
+    species,
+    className,
+    density,
+    a_pred,
+    b_pred,
+    c_th
+  )]
+
+  for (i in seq_len(nrow(stage_table))) {
+    s <- as.integer(stage_table$stage[i])
+    so <- as.integer(stage_table$stage_order[i])
+    x <- as.numeric(stage_table$x[i])
+    path <- stage_table$path[i]
+
+    cat(sprintf("[%s] stage %04d (%d/%d)\n", method, s, i, nrow(stage_table)))
+
+    lut <- load_fn(s, path)
+
+    if (nrow(lut)) {
+      pu <- lut[
+        ,
+        .(
+          pu_area_km2 = sum(patch_area_km2, na.rm = TRUE),
+          n_patches = .N
+        ),
+        by = .(scientificName, species, pu_id)
+      ]
+
+      pu <- merge(
+        pu,
+        par_small,
+        by = c("scientificName", "species"),
+        all.x = TRUE,
+        sort = FALSE
+      )
+
+      assert(all(!is.na(pu$density)),
+             paste0("Missing species parameters after joining LUT for method=",
+                    method, ", stage=", s, "."))
+
+      pu[, P_pu := pu_persist(
+        area_km2 = pu_area_km2,
+        density = density,
+        a_pred = a_pred,
+        b_pred = b_pred,
+        c_th = c_th
+      )]
+
+      pu_keep <- pu[, .(
+        method = method,
+        stage = s,
+        stage_order = so,
+        x = x,
+        scientificName,
+        species,
+        pu_id,
+        pu_area_km2,
+        n_patches,
+        P_pu
+      )]
+
+      sp_stage <- pu_keep[
+        ,
+        .(
+          sp_persist = sp_persist(P_pu),
+          n_pu = .N,
+          total_pu_area_km2 = sum(pu_area_km2, na.rm = TRUE)
+        ),
+        by = .(scientificName, species)
+      ]
+
+    } else {
+      pu_keep <- data.table(
+        method = character(),
+        stage = integer(),
+        stage_order = integer(),
+        x = numeric(),
+        scientificName = character(),
+        species = character(),
+        pu_id = integer(),
+        pu_area_km2 = numeric(),
+        n_patches = integer(),
+        P_pu = numeric()
+      )
+
+      sp_stage <- data.table(
+        scientificName = character(),
+        species = character(),
+        sp_persist = numeric(),
+        n_pu = integer(),
+        total_pu_area_km2 = numeric()
+      )
+    }
+
+    sp_full <- merge(
+      par[, .(scientificName, species, className)],
+      sp_stage,
+      by = c("scientificName", "species"),
+      all.x = TRUE,
+      sort = FALSE
+    )
+
+    sp_full[is.na(sp_persist), sp_persist := 0]
+    sp_full[is.na(n_pu), n_pu := 0L]
+    sp_full[is.na(total_pu_area_km2), total_pu_area_km2 := 0]
+
+    sp_full[, `:=`(
+      method = method,
+      stage = s,
+      stage_order = so,
+      x = x
+    )]
+
+    setcolorder(sp_full, c(
+      "method",
+      "stage",
+      "stage_order",
+      "x",
+      "scientificName",
+      "species",
+      "className",
+      "sp_persist",
+      "n_pu",
+      "total_pu_area_km2"
+    ))
+
+    pu_list[[i]] <- pu_keep
+    sp_list[[i]] <- sp_full
+
+    rm(lut, pu_keep, sp_stage, sp_full)
+    if (exists("pu")) rm(pu)
+    gc(FALSE)
+  }
+
+  list(
+    pu_long = rbindlist(pu_list, use.names = TRUE, fill = TRUE),
+    sp_long = rbindlist(sp_list, use.names = TRUE, fill = TRUE)
+  )
+}
+```
+
+---
+
+## Chunk 04 — run comparison and save outputs
+
+```{r}
+# ============================================================
+# 04_run_write
+# ============================================================
+
+all_outputs_exist <- all(file.exists(c(out_pu, out_sp, out_stage, out_compare)))
+
+if (!overwrite && all_outputs_exist) {
+  cat("[persist_cmp] Outputs exist and overwrite=FALSE -> loading existing outputs.\n")
+  pu_long <- fread(out_pu)
+  sp_long <- fread(out_sp)
+  stage_sum <- fread(out_stage)
+  stage_compare <- fread(out_compare)
+
+} else {
+  res_pipe <- compute_method(
+    stage_table = pipe_st,
+    method = "pipe",
+    load_fn = load_pipe_lut,
+    par = par
+  )
+
+  res_rank <- compute_method(
+    stage_table = rank_st,
+    method = "rank",
+    load_fn = load_rank_lut,
+    par = par
+  )
+
+  pu_long <- rbindlist(
+    list(res_pipe$pu_long, res_rank$pu_long),
+    use.names = TRUE,
+    fill = TRUE
+  )
+
+  sp_long <- rbindlist(
+    list(res_pipe$sp_long, res_rank$sp_long),
+    use.names = TRUE,
+    fill = TRUE
+  )
+
+  # Fixed denominator: all retained species appear in sp_long at every stage.
+  stage_sum <- sp_long[
+    ,
+    .(
+      n_species = .N,
+      n_species_with_pu = sum(n_pu > 0),
+      mean_persist = mean(sp_persist),
+      median_persist = median(sp_persist),
+      q10_persist = as.numeric(quantile(sp_persist, 0.10, names = FALSE)),
+      q90_persist = as.numeric(quantile(sp_persist, 0.90, names = FALSE)),
+      min_persist = min(sp_persist),
+      max_persist = max(sp_persist),
+      frac_gt_05 = mean(sp_persist > 0.5),
+      total_pu_area_km2 = sum(total_pu_area_km2, na.rm = TRUE)
+    ),
+    by = .(method, stage, stage_order, x)
+  ]
+
+  setorder(stage_sum, method, stage_order)
+
+  stage_compare <- dcast(
+    stage_sum[
+      ,
+      .(
+        stage,
+        stage_order,
+        x,
+        method,
+        mean_persist,
+        median_persist,
+        frac_gt_05,
+        total_pu_area_km2
+      )
+    ],
+    stage + stage_order + x ~ method,
+    value.var = c(
+      "mean_persist",
+      "median_persist",
+      "frac_gt_05",
+      "total_pu_area_km2"
+    )
+  )
+
+  if (all(c("mean_persist_pipe", "mean_persist_rank") %in% names(stage_compare))) {
+    stage_compare[
+      ,
+      mean_persist_diff_pipe_minus_rank :=
+        mean_persist_pipe - mean_persist_rank
+    ]
+  }
+
+  if (all(c("median_persist_pipe", "median_persist_rank") %in% names(stage_compare))) {
+    stage_compare[
+      ,
+      median_persist_diff_pipe_minus_rank :=
+        median_persist_pipe - median_persist_rank
+    ]
+  }
+
+  if (all(c("total_pu_area_km2_pipe", "total_pu_area_km2_rank") %in% names(stage_compare))) {
+    stage_compare[
+      ,
+      total_pu_area_diff_pipe_minus_rank :=
+        total_pu_area_km2_pipe - total_pu_area_km2_rank
+    ]
+  }
+
+  setorder(stage_compare, stage_order)
+
+  fwrite(pu_long, out_pu)
+  fwrite(sp_long, out_sp)
+  fwrite(stage_sum, out_stage)
+  fwrite(stage_compare, out_compare)
+
+  cat("\n[persist_cmp] Wrote:\n")
+  cat("  - ", out_pu, "\n", sep = "")
+  cat("  - ", out_sp, "\n", sep = "")
+  cat("  - ", out_stage, "\n", sep = "")
+  cat("  - ", out_compare, "\n", sep = "")
+
+  rm(res_pipe, res_rank)
+  gc(FALSE)
+}
+```
+
+---
+
+## Chunk 05 — final validation and compact preview
+
+```{r}
+# ============================================================
+# 05_validate_outputs
+# ============================================================
+
+expected_methods <- c("pipe", "rank")
+expected_stage_n <- nrow(stage_meta)
+expected_species_n <- nrow(par)
+
+assert(all(expected_methods %in% unique(sp_long$method)),
+       "sp_long is missing one or more methods.")
+
+sp_counts <- sp_long[, .N, by = .(method, stage)]
+
+bad_counts <- sp_counts[N != expected_species_n]
+assert(nrow(bad_counts) == 0L,
+       paste0(
+         "sp_long does not have exactly one row per retained species ",
+         "for every method-stage combination."
+       ))
+
+stage_counts <- stage_sum[, .N, by = method]
+bad_stage_counts <- stage_counts[N != expected_stage_n]
+assert(nrow(bad_stage_counts) == 0L,
+       "stage_sum does not contain the expected number of stages for each method.")
+
+assert(all(sp_long$sp_persist >= 0 & sp_long$sp_persist <= 1),
+       "sp_long contains species persistence values outside [0, 1].")
+
+assert(all(pu_long$P_pu >= 0 & pu_long$P_pu <= 1),
+       "pu_long contains PU persistence values outside [0, 1].")
+
+cat("\n[persist_cmp] Output validation passed.\n\n")
+
+print(stage_sum[order(method, stage_order)][
+  ,
+  .(
+    method,
+    stage,
+    x,
+    n_species,
+    n_species_with_pu,
+    mean_persist,
+    median_persist,
+    frac_gt_05,
+    total_pu_area_km2
+  )
+])
+
+cat("\n[stage_compare preview]\n")
+print(stage_compare)
+```
+
+```{r}
+# ============================================================
+# 04_plot_mean — panel (a) for combined figure
+# ============================================================
+
+if (!exists("stage_sum")) stage_sum <- fread(out_stage)
+
+plot_dt_mean <- copy(stage_sum)[
+  ,
+  method_lab := label_method(method)
+][order(method_lab, stage_order)]
+
+x_breaks_mean <- stage_breaks_shared(plot_dt_mean$x)
+
+p_mean <- ggplot(
+  plot_dt_mean,
+  aes(x = x, y = mean_persist, color = method_lab)
+) +
+  geom_line(linewidth = 0.95, lineend = "round") +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = method_cols, name = NULL) +
+  scale_x_continuous(
+    breaks = x_breaks_mean,
+    labels = scales::label_number(accuracy = 1),
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = persist_breaks_shared,
+    labels = persist_labels_shared,
+    expand = expansion(mult = c(0, 0.01))
+  ) +
+  labs(
+    x = xlab_plot,
+    y = "Mean persistence"
+  ) +
+  theme_persist(base_size = 11) +
+  theme(
+    legend.position = "none"
+  )
+
+p_mean_leg <- p_mean +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.box.margin = margin(t = 2)
+  ) +
+  guides(
+    color = guide_legend(
+      nrow = 1,
+      byrow = TRUE,
+      override.aes = list(linewidth = 1.15, shape = 16, size = 3)
+    )
+  )
+```
+
+```{r}
+# ============================================================
+# 04b_focal_species — single focal species used across panels
+# ============================================================
+
+focal_name <- if (!is.null(params$focus_species) && length(params$focus_species) >= 1L) {
+  as.character(params$focus_species[[1]])
+} else {
+  "Galidia elegans" # "Hapalemur alaotrensis", "Pterocles personatus", "Galidia elegans"
+}
+focal_id <- sid(focal_name)
+
+cat("[persist_cmp] focal species:", focal_name, "\n")
+```
+
+```{r}
+library(ggplot2)
+
+label_method <- function(x) {
+  dplyr::recode(
+    as.character(x),
+    pipe = "Persistence-based",
+    rank = "Area-ranked",
+    .default = as.character(x)
+  )
+}
+
+method_cols <- c(
+  "Persistence-based" = "#2E78AF",
+  "Area-ranked" = "#B7561D"
+)
+
+persist_breaks_shared <- seq(0, 1, by = 0.25)
+persist_labels_shared <- scales::label_number(accuracy = 0.01)
+
+stage_breaks_shared <- function(x) pretty(x, n = 5)
+
+xlab_plot <- "Stage"
+
+theme_persist <- function(base_size = 11) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.title = element_text(colour = "grey20"),
+      axis.text = element_text(colour = "grey20"),
+      axis.line = element_line(colour = "grey20", linewidth = 0.45),
+      axis.ticks = element_line(colour = "grey20", linewidth = 0.45),
+      legend.position = "top",
+      legend.title = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0),
+      plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+    )
+}
+```
+
+```{r}
+# ============================================================
+# 05_plot_focus_panel — panel (b) for combined figure
+# focal species persistence across the removal sequence
+# ============================================================
+
+if (!exists("sp_long")) sp_long <- fread(out_sp)
+
+dd_focus <- sp_long[species == focal_id]
+if (!nrow(dd_focus)) {
+  stop(paste0("Species not found in sp_long: ", focal_name), call. = FALSE)
+}
+
+plot_dt_focus <- copy(dd_focus)[
+  ,
+  method_lab := label_method(method)
+][order(method_lab, stage_order)]
+
+x_breaks_focus <- stage_breaks_shared(plot_dt_focus$x)
+
+p_focus <- ggplot(
+  plot_dt_focus,
+  aes(x = x, y = sp_persist, color = method_lab)
+) +
+  geom_line(linewidth = 0.95, lineend = "round") +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = method_cols, name = NULL) +
+  scale_x_continuous(
+    breaks = x_breaks_focus,
+    labels = scales::label_number(accuracy = 1),
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = persist_breaks_shared,
+    labels = persist_labels_shared,
+    expand = expansion(mult = c(0, 0.01))
+  ) +
+  labs(
+    x = xlab_plot,
+    y = "Species persistence"
+  ) +
+  theme_persist(base_size = 11) +
+    theme(
+      legend.position = "none",
+      axis.ticks.x = element_line(linewidth = 0.45, colour = "grey20"),
+      axis.ticks.length.x = grid::unit(2.2, "pt"),
+      plot.caption = element_text(
+        hjust = 0.5,
+        colour = "grey20",
+        margin = margin(t = 4)
+      ),
+      plot.margin = margin(0, 0, 0, 0)
+    )
+```
+
+```{r}
+# ============================================================
+# 06_top10_auc_gap — top 10 species by area between pipe vs rank
+# Uses trapezoidal integration of |pipe - rank| across x
+# ============================================================
+
+if (!exists("sp_long")) sp_long <- fread(out_sp)
+
+# ---- species metadata: taxon + body mass + diet/density/dispersal ----
+species_header <- names(fread(species_csv, nrows = 0))
+
+need_meta_cols <- c(
+  "scientificName",
+  "className",
+  "BodyMass.Value",
+  "Diet",
+  "density",
+  "dispersal_dist"
+)
+
+missing_meta_cols <- setdiff(need_meta_cols, species_header)
+if (length(missing_meta_cols)) {
+  stop(
+    "species_table.csv is missing column(s): ",
+    paste(missing_meta_cols, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+sp_meta <- fread(species_csv, select = need_meta_cols)
+
+sp_meta[, scientificName := trimws(as.character(scientificName))]
+sp_meta[, species := sid(scientificName)]
+
+sp_meta[, taxon := fifelse(
+  tolower(trimws(className)) == "mammalia", "Mammal",
+  fifelse(tolower(trimws(className)) == "aves", "Bird", as.character(className))
+)]
+
+sp_meta[, body_mass_g := suppressWarnings(as.numeric(BodyMass.Value))]
+sp_meta[, density := suppressWarnings(as.numeric(density))]
+sp_meta[, dispersal_dist_km := suppressWarnings(as.numeric(dispersal_dist))]
+sp_meta[, diet := as.character(Diet)]
+
+sp_meta <- unique(
+  sp_meta[, .(
+    species,
+    taxon,
+    body_mass_g,
+    diet,
+    density,
+    dispersal_dist_km
+  )]
+)
+
+# Keep only the columns needed and reshape so pipe/rank are side by side
+auc_dt <- dcast(
+  sp_long[, .(species, scientificName, stage, stage_order, x, method, sp_persist)],
+  species + scientificName + stage + stage_order + x ~ method,
+  value.var = "sp_persist"
+)
+
+# Require both methods to be present
+auc_dt <- auc_dt[is.finite(pipe) & is.finite(rank)]
+setorder(auc_dt, species, stage_order)
+
+# Pointwise absolute gap between trajectories
+auc_dt[, gap := abs(pipe - rank)]
+
+# Trapezoidal AUC of the gap for each species
+top10_auc_gap <- auc_dt[, {
+  if (.N < 2L) {
+    .(auc_gap = NA_real_)
+  } else {
+    dx <- diff(x)
+    avg_gap <- (gap[-.N] + gap[-1L]) / 2
+    .(auc_gap = sum(dx * avg_gap, na.rm = TRUE))
+  }
+}, by = .(species, scientificName)]
+
+# Add taxon and body mass
+top10_auc_gap <- merge(
+  top10_auc_gap,
+  sp_meta,
+  by = "species",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+# Print the 10 species with the largest area between curves
+top10_auc_gap <- top10_auc_gap[is.finite(auc_gap)][order(-auc_gap)]
+top10_auc_gap[, rank := seq_len(.N)]
+
+print(
+  top10_auc_gap[
+    1:min(10, .N),
+    .(
+      rank,
+      scientificName,
+      species,
+      taxon,
+      body_mass_g,
+      diet,
+      density,
+      dispersal_dist_km,
+      auc_gap
+    )
+  ]
+)
+```
+
+```{r}
+# ============================================================
+# 07_plot_species_total_area — panel (c) for combined figure
+# Simplified stacked bars:
+# - show only every other stage
+# - color segments by current PU persistence probability
+# - use DIFFERENT fill scales for the two methods
+# - within each bar, larger / more persistent PUs are stacked lower
+# - draw all PU segments with the same border symbology
+# - add a light outline around each full bar
+# ============================================================
+
+if (!exists("pu_long")) pu_long <- fread(out_pu)
+
+dd <- pu_long[
+  species == focal_id & method %in% c("pipe", "rank"),
+  .(method, stage, stage_order, pu_id, pu_area_km2, P_pu)
+]
+
+if (!nrow(dd)) {
+  stop(paste0("Species not found in pu_long: ", focal_name), call. = FALSE)
+}
+
+# ---- current PU area + persistence by stage ----
+dd_sum <- dd[
+  ,
+  .(
+    pu_area_km2 = sum(pu_area_km2, na.rm = TRUE),
+    current_P_pu = max(P_pu, na.rm = TRUE)
+  ),
+  by = .(method, stage, stage_order, pu_id)
+]
+
+# only every other stage
+plot_stages <- sort(unique(dd_sum$stage[dd_sum$stage %% 2L == 0L]))
+if (!length(plot_stages)) plot_stages <- sort(unique(dd_sum$stage))
+
+dd_sum <- dd_sum[stage %in% plot_stages]
+
+# use all PUs observed for this focal species across the sequence
+all_pu_ids <- sort(unique(dd$pu_id))
+
+stage_key <- unique(dd_sum[, .(method, stage, stage_order)])
+setorder(stage_key, method, stage_order)
+
+grid_dt <- CJ(
+  method = unique(dd_sum$method),
+  stage  = plot_stages,
+  pu_id  = all_pu_ids,
+  unique = TRUE
+)
+
+grid_dt <- merge(
+  grid_dt,
+  stage_key,
+  by = c("method", "stage"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+dd_plot <- merge(
+  grid_dt,
+  dd_sum,
+  by = c("method", "stage", "stage_order", "pu_id"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+dd_plot[is.na(pu_area_km2), pu_area_km2 := 0]
+dd_plot[is.na(current_P_pu), current_P_pu := 0]
+
+# bottom of stack = larger and/or more persistent PUs
+dd_plot[
+  ,
+  stack_score := {
+    area_max <- max(pu_area_km2, na.rm = TRUE)
+    area_std <- if (is.finite(area_max) && area_max > 0) pu_area_km2 / area_max else 0
+    0.5 * area_std + 0.5 * current_P_pu
+  },
+  by = .(method, stage, stage_order)
+]
+
+setorder(dd_plot, method, stage_order, -stack_score, -pu_area_km2, -current_P_pu, pu_id)
+
+dd_plot[
+  ,
+  `:=`(
+    ymin = c(0, cumsum(pu_area_km2)[-.N]),
+    ymax = cumsum(pu_area_km2)
+  ),
+  by = .(method, stage, stage_order)
+]
+
+stage_show <- dd_plot[order(stage_order), unique(stage)]
+dd_plot[, stage_index := match(stage, stage_show)]
+dd_plot[, x_plot := stage_index + fifelse(method == "pipe", -0.22, 0.22)]
+
+bar_half_width <- 0.19
+dd_plot[, `:=`(
+  xmin = x_plot - bar_half_width,
+  xmax = x_plot + bar_half_width
+)]
+
+bar_outline <- dd_plot[
+  pu_area_km2 > 0,
+  .(
+    xmin = min(xmin),
+    xmax = max(xmax),
+    ymin = 0,
+    ymax = max(ymax)
+  ),
+  by = .(method, stage, stage_order)
+]
+
+y_max <- dd_plot[, max(ymax, na.rm = TRUE)]
+
+# method-specific persistence palettes
+pipe_fill_cols <- c(
+  "#F2F4F7",
+  "#DCE7F0",
+  "#BCD4E6",
+  "#8FB8D8",
+  "#5F99C6",
+  "#2E78AF"
+)
+
+rank_fill_cols <- c(
+  "#FCF3ED",
+  "#F8DDCF",
+  "#F2C0A6",
+  "#EA9A72",
+  "#D9723F",
+  "#B7561D"
+)
+
+pipe_pal <- scales::col_numeric(
+  palette = pipe_fill_cols,
+  domain = c(0, 1),
+  na.color = "#F2F4F7"
+)
+
+rank_pal <- scales::col_numeric(
+  palette = rank_fill_cols,
+  domain = c(0, 1),
+  na.color = "#FCF3ED"
+)
+
+dd_plot[
+  ,
+  fill_col := ifelse(
+    method == "pipe",
+    pipe_pal(current_P_pu),
+    rank_pal(current_P_pu)
+  )
+]
+
+p_area <- ggplot() +
+  geom_rect(
+    data = dd_plot[pu_area_km2 > 0],
+    aes(
+      xmin = xmin,
+      xmax = xmax,
+      ymin = ymin,
+      ymax = ymax,
+      fill = fill_col
+    ),
+    color = "white",
+    linewidth = 0.22,
+    linejoin = "mitre"
+  ) +
+  geom_rect(
+    data = bar_outline,
+    aes(
+      xmin = xmin,
+      xmax = xmax,
+      ymin = ymin,
+      ymax = ymax
+    ),
+    fill = NA,
+    color = "grey78",
+    linewidth = 0.35,
+    linejoin = "mitre"
+  ) +
+  scale_fill_identity() +
+  scale_x_continuous(
+    breaks = seq_along(stage_show),
+    labels = as.character(stage_show),
+    expand = expansion(mult = c(0.03, 0.03))
+  ) +
+  scale_y_continuous(
+    breaks = pretty(c(0, y_max), n = 4),
+    labels = scales::label_number(big.mark = ","),
+    expand = expansion(mult = c(0, 0.03))
+  ) +
+  coord_cartesian(ylim = c(0, y_max * 1.05), clip = "off") +
+  labs(
+    x = "Stage",
+    y = expression("Total PU area (km"^2*")")
+  ) +
+  theme_persist(base_size = 11) +
+  theme(
+    legend.position = "none"
+  )
+
+# ---- legend donor: compact stacked colour bars with shared label below ----
+legend_x <- seq(0, 1, length.out = 1024)
+pipe_raster <- as.raster(matrix(pipe_pal(legend_x), nrow = 1))
+rank_raster <- as.raster(matrix(rank_pal(legend_x), nrow = 1))
+
+p_area_leg <- ggplot() +
+  annotation_raster(
+    raster = pipe_raster,
+    xmin = 0, xmax = 1,
+    ymin = 0.61, ymax = 0.73
+  ) +
+  annotation_raster(
+    raster = rank_raster,
+    xmin = 0, xmax = 1,
+    ymin = 0.45, ymax = 0.57
+  ) +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = persist_breaks_shared,
+    labels = persist_labels_shared,
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    limits = c(0.38, 0.77),
+    breaks = NULL,
+    labels = NULL,
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    caption = "PU persistence probability"
+  ) +
+  theme_classic(base_size = 10.1) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(colour = "grey20"),
+    axis.line.x = element_line(linewidth = 0.45, colour = "grey20"),
+    axis.ticks.x = element_line(linewidth = 0.45, colour = "grey20"),
+    axis.ticks.length.x = grid::unit(2.2, "pt"),
+    plot.caption = element_text(
+      hjust = 0.5,
+      colour = "grey20",
+      margin = margin(t = 4)
+    ),
+    plot.margin = margin(0, 0, 0, 0)
+  )
+```
+
+```{r}
+# ============================================================
+# 08_plot_species_persist_vs_total_area — panel (d) for combined figure
+# Extend each method trajectory to the origin (0, 0)
+# ============================================================
+
+if (!exists("pu_long")) pu_long <- fread(out_pu)
+if (!exists("sp_long")) sp_long <- fread(out_sp)
+
+area_dt <- pu_long[
+  species == focal_id & method %in% c("pipe", "rank"),
+  .(total_area_km2 = sum(pu_area_km2, na.rm = TRUE)),
+  by = .(method, stage, stage_order)
+]
+
+persist_dt <- sp_long[
+  species == focal_id & method %in% c("pipe", "rank"),
+  .(method, stage, stage_order, sp_persist)
+]
+
+plot_dt_area <- merge(
+  area_dt,
+  persist_dt,
+  by = c("method", "stage", "stage_order"),
+  all = FALSE,
+  sort = FALSE
+)
+
+if (!nrow(plot_dt_area)) {
+  stop(paste0("Species not found in pu_long/sp_long: ", focal_name), call. = FALSE)
+}
+
+plot_dt_area[, method_lab := label_method(method)]
+
+# add an origin row for each method so the line reaches (0, 0)
+origin_dt <- unique(plot_dt_area[, .(method)])
+origin_dt[, `:=`(
+  stage = NA_integer_,
+  stage_order = Inf,
+  total_area_km2 = 0,
+  sp_persist = 0,
+  method_lab = label_method(method)
+)]
+
+plot_dt_area_path <- rbindlist(
+  list(plot_dt_area, origin_dt),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+setorder(plot_dt_area_path, method, total_area_km2, stage_order)
+setorder(plot_dt_area, method, total_area_km2, stage_order)
+
+x_max <- max(plot_dt_area$total_area_km2, na.rm = TRUE)
+
+p_area_persist <- ggplot() +
+  geom_path(
+    data = plot_dt_area_path,
+    aes(x = total_area_km2, y = sp_persist, color = method_lab),
+    linewidth = 0.95,
+    lineend = "round"
+  ) +
+  geom_point(
+    data = plot_dt_area,
+    aes(x = total_area_km2, y = sp_persist, color = method_lab),
+    size = 1.8
+  ) +
+  scale_color_manual(values = method_cols, name = NULL) +
+  scale_x_continuous(
+    limits = c(0, x_max * 1.02),
+    breaks = pretty(c(0, x_max), n = 4),
+    labels = scales::label_number(big.mark = ","),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = persist_breaks_shared,
+    labels = persist_labels_shared,
+    expand = expansion(mult = c(0, 0.01))
+  ) +
+  labs(
+    x = expression("Retained PU area (km"^2*")"),
+    y = "Species persistence"
+  ) +
+  theme_persist(base_size = 11) +
+  theme(
+    legend.position = "none"
+  )
+```
+
+```{r, fig.width=7, fig.height=6}
+# ============================================================
+# 09_plot_combined_figure — one 4-panel figure
+# Legend layout:
+#   left  = stacked colour-bar legend
+#   right = method legend
+# ============================================================
+
+stopifnot(
+  exists("p_mean"),
+  exists("p_mean_leg"),
+  exists("p_focus"),
+  exists("p_area"),
+  exists("p_area_persist"),
+  exists("p_area_leg")
+)
+
+legend_methods <- cowplot::get_legend(p_mean_leg)
+
+p_a <- p_mean +
+  theme(
+    plot.margin = margin(10, 8, 8, 14),
+    axis.title.x = element_text(margin = margin(t = 6))
+  )
+
+p_b <- p_focus +
+  theme(
+    plot.margin = margin(10, 5, 8, 14),
+    axis.title.x = element_text(margin = margin(t = 6))
+  )
+
+p_c <- p_area +
+  theme(
+    plot.margin = margin(10, 8, 5, 14)
+  )
+
+p_d <- p_area_persist +
+  theme(
+    plot.margin = margin(10, 5, 5, 14)
+  )
+
+# -------------------------
+# small header strips above each panel
+# keeps the plot panel itself the same size
+# -------------------------
+
+n_included_species <- uniqueN(par$species)
+
+hdr_all   <- sprintf("All species (n = %d)", n_included_species)
+hdr_focal <- paste0(focal_name)
+
+panel_header <- function(txt, size = 10) {
+  cowplot::ggdraw() +
+    cowplot::draw_label(
+      txt,
+      x = 0.6, y = 0.2,
+      hjust = 0.5, vjust = 0.5,
+      size = size,
+      color = "grey20",
+      fontface = "plain"
+    )
+}
+
+add_header_strip <- function(panel, txt, rel_header = 0.09) {
+  cowplot::plot_grid(
+    panel_header(txt),
+    panel,
+    ncol = 1,
+    rel_heights = c(rel_header, 1)
+  )
+}
+
+tag_panel <- function(p, tag, draw_x = 0.055, draw_y = 0.02, draw_w = 0.945, draw_h = 0.945) {
+  cowplot::ggdraw() +
+    cowplot::draw_plot(p, x = draw_x, y = draw_y, width = draw_w, height = draw_h) +
+    cowplot::draw_plot_label(
+      tag,
+      x = 0.01, y = 0.99,
+      hjust = 0, vjust = 1,
+      fontface = "bold",
+      size = 12.5
+    )
+}
+
+p_a_tag <- tag_panel(p_a, "(a)")
+p_b_tag <- tag_panel(p_b, "(b)")
+p_c_tag <- tag_panel(p_c, "(c)")
+p_d_tag <- tag_panel(p_d, "(d)")
+
+p_a_box <- add_header_strip(p_a_tag, hdr_all)
+p_b_box <- add_header_strip(p_b_tag, hdr_focal)
+p_c_box <- add_header_strip(p_c_tag, hdr_focal)
+p_d_box <- add_header_strip(p_d_tag, hdr_focal)
+
+panel_grid <- cowplot::plot_grid(
+  p_a_box, p_b_box, p_c_box, p_d_box,
+  ncol = 2,
+  align = "hv",
+  axis = "tblr"
+)
+
+# -------------------------
+# knobs for legend placement
+# -------------------------
+
+# move the ENTIRE legend block right/left
+legend_shift_right <- 0.13   # increase -> moves both legends right
+legend_total_width <- 0.86   # total width used by both legends together
+
+# relative widths of the left and right legend slots
+left_leg_rel_width  <- 0.58  # stacked colour-bar legend slot
+right_leg_rel_width <- 0.42  # method legend slot
+
+# LEFT legend (stacked colour-bar legend) placement inside its slot
+pu_leg_inner_x      <- 0.11  # increase -> moves left legend right within left slot
+pu_leg_inner_width  <- 0.52  # increase -> makes left legend wider
+
+# RIGHT legend (method legend) placement inside its slot
+method_leg_inner_x     <- 0.07  # increase -> moves right legend right within right slot
+method_leg_inner_width <- 0.82  # increase -> makes right legend wider
+
+# -------------------------
+# build legend row
+# -------------------------
+
+p_area_leg_left <- cowplot::ggdraw() +
+  cowplot::draw_plot(
+    p_area_leg,
+    x = pu_leg_inner_x,
+    y = 0.02,
+    width = pu_leg_inner_width,
+    height = 0.96
+  )
+
+legend_methods_right <- cowplot::ggdraw() +
+  cowplot::draw_plot(
+    legend_methods,
+    x = method_leg_inner_x,
+    y = 0.00,
+    width = method_leg_inner_width,
+    height = 1.00
+  )
+
+legend_row_raw <- cowplot::plot_grid(
+  p_area_leg_left,
+  legend_methods_right,
+  nrow = 1,
+  rel_widths = c(left_leg_rel_width, right_leg_rel_width)
+)
+
+legend_row <- cowplot::ggdraw() +
+  cowplot::draw_plot(
+    legend_row_raw,
+    x = legend_shift_right,
+    y = 0,
+    width = legend_total_width,
+    height = 1
+  )
+
+fig_cmp_4panel <- cowplot::plot_grid(
+  panel_grid,
+  legend_row,
+  ncol = 1,
+  rel_heights = c(1, 0.14)
+)
+
+fig_cmp_4panel
+```
