@@ -1,0 +1,131 @@
+internalTaxonId,scientificName,name,genusName,speciesName,speciesAuthor,infraType,infrarankAuthor
+8668,Fossa fossana,"Viverra fossa Schreber, 1777",Viverra,fossa,"Schreber, 1777",,
+8833,Galidictis fasciata,"Viverra fasciata Gmelin, 1788",Viverra,fasciata,"Gmelin, 1788",,
+13923,Mungotictis decemlineata,"Mungotictis lineata Pocock, 1915",Mungotictis,lineata,"Pocock, 1915",,
+13923,Mungotictis decemlineata,"Mungotictis substriatus Pocock, 1915",Mungotictis,substriatus,"Pocock, 1915",,
+13923,Mungotictis decemlineata,"Mungotictis vittatus Gray, 1848",Mungotictis,vittatus,"Gray, 1848",,
+19852,Salanoia concolor,"Salanoia  olivacea (I. Geoffroy Saint-Hilaire, 1839)",Salanoia ,olivacea,"(I. Geoffroy Saint-Hilaire, 1839)",,
+19852,Salanoia concolor,"Salanoia unicolor (I. Geoffroy Saint-Hilaire, 1837)",Salanoia,unicolor,"(I. Geoffroy Saint-Hilaire, 1837)",,
+19852,Salanoia concolor,"Salanoia  durrelli Durbin, Funk, Hawkins, Hills, Jenkins, Moncrieff & Ralainasolo, 2010",Salanoia ,durrelli,"Durbin, Funk, Hawkins, Hills, Jenkins, Moncrieff & Ralainasolo, 2010",,
+19852,Salanoia concolor,"Galidia concolor I. Geoffroy Saint-Hilaire, 1837",Galidia,concolor,"I. Geoffroy Saint-Hilaire, 1837",,
+39547,Eupleres major,"Eupleres goudotii ssp. major Lavauden, 1929",Eupleres,goudotii,,subspecies,"Lavauden, 1929"
+68336601,Eupleres goudotii,"Eupleres goudotii ssp. goudotti Doyère, 1835",Eupleres,goudotii,,subspecies,"Doyère, 1835"
+40783,Hippopotamus madagascariensis,"Hippopotamus guldbergi Fovet, Faure & Guérin, 2011",Hippopotamus,guldbergi,"Fovet, Faure & Guérin, 2011",,
+40782,Hippopotamus lemerlei,"Hippopotamus madagascariensis Guldberg, 1883 [illegitimate replacement name]",Hippopotamus,madagascariensis,"Guldberg, 1883 [illegitimate replacement name]",,
+40593,Hemicentetes semispinosus,"Ericulus semispinosus G. Cuvier, 1798",Ericulus,semispinosus,"G. Cuvier, 1798",,
+11979,Microgale mergulus,"Limnogale mergulus Forsyth Major, 1896",Limnogale,mergulus,"Forsyth Major, 1896",,
+40587,Nesogale dobsoni,"Microgale dobsoni Thomas, 1884",Microgale,dobsoni,"Thomas, 1884",,
+13349,Microgale parvula,"Microgale pulla Jenkins, 1988",Microgale,pulla,"Jenkins, 1988",,
+41315,Nesogale talazaci,"Microgale talazaci Forsyth Major, 1896",Microgale,talazaci,"Forsyth Major, 1896",,
+40589,Oryzorictes hova,"Oryzorictes talpoides G. Grandidier & Petit, 1930",Oryzorictes,talpoides,"G. Grandidier & Petit, 1930",,
+40591,Oryzorictes tetradactylus,"Oryzorictes teradactylus Milne-Edwards & A. Grandidier, 1882 [orth. error]",Oryzorictes,teradactylus,"Milne-Edwards & A. Grandidier, 1882 [orth. error]",,
+40594,Setifer setosus,"Erinaceus setosus Schreber, 1778",Erinaceus,setosus,"Schreber, 1778",,
+40595,Tenrec ecaudatus,"Erinaceus ecaudatus Schreber, 1778",Erinaceus,ecaudatus,"Schreber, 1778",,
+868,Allocebus trichotis,"Cheirogaleus trichotis Günther, 1875",Cheirogaleus,trichotis,"Günther, 1875",,
+6302,Daubentonia madagascariensis,"Sciurus madagascariensis Gmelin, 1788",Sciurus,madagascariensis,"Gmelin, 1788",,
+8202,Eulemur mongoz,"Lemur mongoz Linnaeus, 1758",Lemur,mongoz,"Linnaeus, 1758",,
+8205,Eulemur cinereiceps,"Eulemur albocollaris (Rumpler, 1975)",Eulemur,albocollaris,"(Rumpler, 1975)",,
+8205,Eulemur cinereiceps,"Eulemur fulvus ssp. albocollaris (A. Grandidier & Milne-Edwards, 1890)",Eulemur,fulvus,,subspecies,"(A. Grandidier & Milne-Edwards, 1890)"
+8206,Eulemur collaris,"Eulemur fulvus ssp. collaris (É. Geoffroy, 1817)",Eulemur,fulvus,,subspecies,"(É. Geoffroy, 1817)"
+8207,Eulemur fulvus,"Eulemur fulvus ssp. mayottensis (Schlegel, 1866)",Eulemur,fulvus,,subspecies,"(Schlegel, 1866)"
+8207,Eulemur fulvus,"Eulemur fulvus ssp. fulvus (É. Geoffroy, 1796)",Eulemur,fulvus,,subspecies,"(É. Geoffroy, 1796)"
+8209,Eulemur rufus,"Eulemur fulvus ssp. rufus (Audebert, 1800)",Eulemur,fulvus,,subspecies,"(Audebert, 1800)"
+8211,Eulemur flavifrons,"Eulemur macaco ssp. flavifrons (Gray, 1867)",Eulemur,macaco,,subspecies,"(Gray, 1867)"
+9673,Hapalemur griseus,"Hapalemur ranomafanensis Rabarivola, Prosper, Zaramody, Andriaholinirina & Hauwy, 2007",Hapalemur,ranomafanensis,"Rabarivola, Prosper, Zaramody, Andriaholinirina & Hauwy, 2007",,
+9674,Prolemur simus,"Hapalemur simus Gray, 1871",Hapalemur,simus,"Gray, 1871",,
+16872,Phaner furcifer,"Phaner furcifer ssp. furcifer (de Blainville, 1839)",Phaner,furcifer,,subspecies,"(de Blainville, 1839)"
+16873,Phaner parienti,"Phaner furcifer ssp. parienti Groves & Tattersall, 1991",Phaner,furcifer,,subspecies,"Groves & Tattersall, 1991"
+16874,Phaner pallescens,"Phaner furcifer ssp. pallescens Groves & Tattersall, 1991",Phaner,furcifer,,subspecies,"Groves & Tattersall, 1991"
+16875,Phaner electromontis,"Phaner furcifer (Groves & Tattersall, 1991) ssp. electromontis",Phaner,furcifer,"(Groves & Tattersall, 1991)",subspecies,
+18354,Propithecus verreauxi,"Propithecus verreauxi ssp. verreauxi A. Grandidier, 1867",Propithecus,verreauxi,,subspecies,"A. Grandidier, 1867"
+18355,Propithecus coquereli,"Propithecus verreauxi ssp. coquereli (A. Grandidier, 1867)",Propithecus,verreauxi,,subspecies,"(A. Grandidier, 1867)"
+18356,Propithecus coronatus,"Propithecus verreauxi ssp. coronatus Milne-Edwards, 1871",Propithecus,verreauxi,,subspecies,"Milne-Edwards, 1871"
+18357,Propithecus deckenii,"Propithecus verreauxi ssp. deckenii A. Grandidier, 1867",Propithecus,verreauxi,,subspecies,"A. Grandidier, 1867"
+18358,Propithecus diadema,"Propithecus diadema ssp. diadema Bennett, 1832",Propithecus,diadema,,subspecies,"Bennett, 1832"
+18359,Propithecus edwardsi,"Propithecus holomelas Günther, 1875",Propithecus,holomelas,"Günther, 1875",,
+18359,Propithecus edwardsi,"Propithecus diadema ssp. edwardsi A. Grandidier, 1871",Propithecus,diadema,,subspecies,"A. Grandidier, 1871"
+18360,Propithecus candidus,"Propithecus diadema ssp. candidus A. Grandidier, 1871",Propithecus,diadema,,subspecies,"A. Grandidier, 1871"
+18361,Propithecus perrieri,"Propithecus diadema ssp. perrieri Lavauden, 1931",Propithecus,diadema,,subspecies,"Lavauden, 1931"
+22918,Varecia variegata,"Lemur macaco ssp. variegatus Kerr, 1792",Lemur,macaco,,subspecies,"Kerr, 1792"
+22920,Varecia rubra,"Varecia variegata ssp. rubra (É. Geoffroy, 1812)",Varecia,variegata,,subspecies,"(É. Geoffroy, 1812)"
+136206,Microcebus mamiratra,"Microcebus lokobensis Olivier et al., 2007",Microcebus,lokobensis,"Olivier et al., 2007",,
+163021377,Cheirogaleus crossleyi,"Cheirogaleus melanotis Forsyth Major, 1894",Cheirogaleus,melanotis,"Forsyth Major, 1894",,
+136254,Lepilemur randrianasoloi,"Lepilemur randrianasoli Andriaholinirina, Fausser, Roos, Rabarivola, Ravoarimanana, Zinner, Thalmann, Ganzhorn, Meier, Hilgartner, Walter, Zaramody, Langer, Hahn, Zimmermann, Radespiel, Craul, Tomiuk, Tattersall & Rumpler, 2006 [name invalid]",Lepilemur,randrianasoli,"Andriaholinirina, Fausser, Roos, Rabarivola, Ravoarimanana, Zinner, Thalmann, Ganzhorn, Meier, Hilgartner, Walter, Zaramody, Langer, Hahn, Zimmermann, Radespiel, Craul, Tomiuk, Tattersall & Rumpler, 2006 [name invalid]",,
+136311,Lepilemur wrightae,"Lepilemur wrighti Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",Lepilemur,wrighti,"Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",,
+136376,Lepilemur aeeclis,"Lepilemur aeeclis Andriaholinirina, Fausser, Roos, Rabarivola, Ravoarimanana, Zinner, Thalmann, Ganzhorn, Meier, Hilgartner, Walter, Zaramody, Langer, Hahn, Zimmermann, Radespiel, Craul, Tomiuk, Tattersall & Rumpler, 2006 [name invalid]",Lepilemur,aeeclis,"Andriaholinirina, Fausser, Roos, Rabarivola, Ravoarimanana, Zinner, Thalmann, Ganzhorn, Meier, Hilgartner, Walter, Zaramody, Langer, Hahn, Zimmermann, Radespiel, Craul, Tomiuk, Tattersall & Rumpler, 2006 [name invalid]",,
+136491,Lepilemur jamesorum,"Lepilemur jamesi Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney &amp; Brenneman, 2006 [orth. error]",Lepilemur,jamesi,"Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney &amp; Brenneman, 2006 [orth. error]",,
+136645,Lepilemur sahamalaza,"Lepilemur sahamalazensis Andriaholinirina, Fausser, Roos, Rabarivola, Ravoarimanana, Zinner, Thalmann, Ganzhorn, Meier, Hilgartner, Walter, Zaramody, Langer, Hahn, Zimmermann, Radespiel, Craul, Tomiuk, Tattersall & Rumpler, 2006 [invalid name]",Lepilemur,sahamalazensis,"Andriaholinirina, Fausser, Roos, Rabarivola, Ravoarimanana, Zinner, Thalmann, Ganzhorn, Meier, Hilgartner, Walter, Zaramody, Langer, Hahn, Zimmermann, Radespiel, Craul, Tomiuk, Tattersall & Rumpler, 2006 [invalid name]",,
+136709,Lepilemur tymerlachsoni,"Lepilemur tymerlachsonorum Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",Lepilemur,tymerlachsonorum,"Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",,
+136761,Lepilemur hubbardorum,"Lepilemur hubbardi Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney &amp; Brenneman, 2006 [orth. error]",Lepilemur,hubbardi,"Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney &amp; Brenneman, 2006 [orth. error]",,
+136771,Lepilemur grewcockorum,"Lepilemur manasamody Craul, Zimmermann, Rasoloharijaona, Randrianambinina & Radespiel, 2007",Lepilemur,manasamody,"Craul, Zimmermann, Rasoloharijaona, Randrianambinina & Radespiel, 2007",,
+136771,Lepilemur grewcockorum,"Lepilemur grewcocki Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney, & Brenneman, 2006 [orth. error]",Lepilemur,grewcocki,"Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney, & Brenneman, 2006 [orth. error]",,
+163023599,Cheirogaleus medius,"Cheirogaleus adipicaudatus A. Grandidier, 1868",Cheirogaleus,adipicaudatus,"A. Grandidier, 1868",,
+54778911,Cheirogaleus major,"Cheirogaleus ravus Groves, 2000",Cheirogaleus,ravus,"Groves, 2000",,
+22698777,Neodrepanis hypoxantha,Neodrepanis hypoxanthus ssp. hypoxanthus — Collar <i>et al</i>. (1994),Neodrepanis,hypoxanthus,,subspecies,— Collar <i>et al</i>. (1994)
+136347,Microcebus danfossi,"Microcebus danfossorum Olivieri, Zimmermann, Randrianambinina, Rassoloharijaona, Rakotondravony, Guschanski & Radespiel, 2007 [illegitimate emendation]]",Microcebus,danfossorum,"Olivieri, Zimmermann, Randrianambinina, Rassoloharijaona, Rakotondravony, Guschanski & Radespiel, 2007 [illegitimate emendation]]",,
+22692949,Mesitornis variegatus,"Mesitornis variegata ssp. variegata Geoffroy Saint-Hilaire, 1838 [orth. error] — Sibley and Monroe (1990, 1993)",Mesitornis,variegata,,subspecies,"Geoffroy Saint-Hilaire, 1838 [orth. error] — Sibley and Monroe (1990, 1993)"
+22692949,Mesitornis variegatus,"Mesitornis variegata ssp. variegata Geoffroy Saint-Hilaire, 1838 [orth. error] — Collar and Andrew (1988)",Mesitornis,variegata,,subspecies,"Geoffroy Saint-Hilaire, 1838 [orth. error] — Collar and Andrew (1988)"
+22692949,Mesitornis variegatus,"Mesitornis variegata ssp. variegata Geoffroy Saint-Hilaire, 1838 [orth. error] — BirdLife International (2000)",Mesitornis,variegata,,subspecies,"Geoffroy Saint-Hilaire, 1838 [orth. error] — BirdLife International (2000)"
+22692949,Mesitornis variegatus,"Mesitornis variegata ssp. variegata Geoffroy Saint-Hilaire, 1838 [orth. error] — Collar <i>et al<i/>. (1994)",Mesitornis,variegata,,subspecies,"Geoffroy Saint-Hilaire, 1838 [orth. error] — Collar <i>et al<i/>. (1994)"
+22710825,Hartlaubius auratus,"Saroglossa aurata (Müller, 1776)",Saroglossa,aurata,"(Müller, 1776)",,
+22678927,Margaroperdix madagarensis,"Margaroperdix madagarensis madagarensis Sibley and Monroe (1990, 1993)",Margaroperdix madagarensis,madagarensis,"Sibley and Monroe (1990, 1993)",,
+22678927,Margaroperdix madagarensis,Margaroperdix madagascariensis,Margaroperdix,madagascariensis,,,
+163022885,Cheirogaleus thomasi,"Opolemur thomasi Forsyth Major, 1894",Opolemur,thomasi,"Forsyth Major, 1894",,
+22713021,Crossleyia tenebrosa,Phyllastrephus tenebrosus tenebrosus BirdLife International (2000),Phyllastrephus tenebrosus,tenebrosus,BirdLife International (2000),,
+22713021,Crossleyia tenebrosa,Bernieria tenebrosus,Bernieria tenebrosus,,BirdLife International (2004),,
+22713021,Crossleyia tenebrosa,Phyllastrephus tenebrosus tenebrosus Collar et al. (1994),Phyllastrephus tenebrosus,tenebrosus,Collar et al. (1994),,
+22713021,Crossleyia tenebrosa,"Phyllastrephus tenebrosus tenebrosus Sibley and Monroe (1990, 1993)",Phyllastrephus tenebrosus,tenebrosus,"Sibley and Monroe (1990, 1993)",,
+22713021,Crossleyia tenebrosa,Phyllastrephus tenebrosus tenebrosus Collar and Andrew (1988),Phyllastrephus tenebrosus,tenebrosus,Collar and Andrew (1988),,
+22713021,Crossleyia tenebrosa,"Bernieria tenebrosa (Stresemann, 1925)",Bernieria,tenebrosa,"(Stresemann, 1925)",,
+22724980,Mentocrex beankaensis,"Canirallus beankaensis Goodman, 2011",Canirallus,beankaensis,"Goodman, 2011",,
+8204,Eulemur albifrons,"Eulemur fulvus ssp. albifrons (É. Geoffroy Saint-Hilaire, 1796)",Eulemur,fulvus,,subspecies,"(É. Geoffroy Saint-Hilaire, 1796)"
+8204,Eulemur albifrons,"Lemur albifrons É. Geoffroy Saint-Hilaire, 1796",Lemur,albifrons,"É. Geoffroy Saint-Hilaire, 1796",,
+8212,Eulemur macaco,"Eulemur macaco ssp. macaco (Linnaeus, 1766)",Eulemur,macaco,,subspecies,"(Linnaeus, 1766)"
+8210,Eulemur sanfordi,"Eulemur fulvus ssp. sanfordi (Archbold, 1932)",Eulemur,fulvus,,subspecies,"(Archbold, 1932)"
+9676,Hapalemur alaotrensis,"Hapalemur griseus ssp. alaotrensis (Rumpler, 1975)",Hapalemur,griseus,,subspecies,"(Rumpler, 1975)"
+8199,Eulemur coronatus,"Lemur coronatus Gray, 1842",Lemur,coronatus,"Gray, 1842",,
+163314248,Microcebus murinus,"Lemus murinus J.F. Miller, 1777",Lemus,murinus,"J.F. Miller, 1777",,
+8203,Eulemur rubriventer,"Lemur rubriventer I. Geoffroy, 1850",Lemur,rubriventer,"I. Geoffroy, 1850",,
+22716161,Hartertula flavoviridis,Hartertula flavoviridis ssp. flavoviridis — BirdLife International (2000),Hartertula,flavoviridis,,subspecies,— BirdLife International (2000)
+22716161,Hartertula flavoviridis,Hartertula flavoviridis ssp. flavoviridis — Collar et al. (1994),Hartertula,flavoviridis,,subspecies,— Collar et al. (1994)
+22716161,Hartertula flavoviridis,"Neomixis flavoviridis Hartert, 1924",Neomixis,flavoviridis,"Hartert, 1924",,
+22716161,Hartertula flavoviridis,Hartertula flavoviridis ssp. flavoviridis — Collar and Andrew (1988),Hartertula,flavoviridis,,subspecies,— Collar and Andrew (1988)
+22682937,Geobiastes squamiger,"Brachypteracias squamigera ssp. squamigera Lafresnaye, 1838 — BirdLife International (2000)",Brachypteracias,squamigera,,subspecies,"Lafresnaye, 1838 — BirdLife International (2000)"
+22682937,Geobiastes squamiger,"Brachypteracias squamigera ssp. squamigera Lafresnaye, 1838 — Dowsett and Forbes-Watson (1993)",Brachypteracias,squamigera,,subspecies,"Lafresnaye, 1838 — Dowsett and Forbes-Watson (1993)"
+22682937,Geobiastes squamiger,"Brachypteracias squamigera ssp. squamigera Lafresnaye, 1838 — Sibley and Monroe (1990, 1993)",Brachypteracias,squamigera,,subspecies,"Lafresnaye, 1838 — Sibley and Monroe (1990, 1993)"
+22682937,Geobiastes squamiger,"Brachypteracias squamiger Lafresnaye, 1838",Brachypteracias,squamiger,"Lafresnaye, 1838",,
+22692654,Zapornia olivieri,"Amaurornis olivieri (Grandidier & Berlioz, 1929)",Amaurornis,olivieri,"(Grandidier & Berlioz, 1929)",,
+136843,Lepilemur ahmansoni,"Lepilemur ahmansorum Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",Lepilemur,ahmansorum,"Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",,
+136843,Lepilemur ahmansoni,"Lepilemur ahmansonorum Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",Lepilemur,ahmansonorum,"Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",,
+136843,Lepilemur ahmansoni,"Lepilemur ahmansonori Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",Lepilemur,ahmansonori,"Louis Jr., Engberg, Lei, Geng, Sommer, Randriamampionona, Randriamanana, Zaonarivelo, Andriantompohavana, Randria, Prosper, Ramaromilanto, Rakotoarisoa, Rooney & Brenneman, 2006 [orth. error]",,
+22680252,Anas bernieri,"Querquedula bernieri Hartlaub, 1860",Querquedula,bernieri,"Hartlaub, 1860",,
+22713004,Xanthomixis apperti,Phyllastrephus apperti ssp. apperti — BirdLife International (2000),Phyllastrephus,apperti,,subspecies,— BirdLife International (2000)
+22713004,Xanthomixis apperti,Phyllastrephus apperti ssp. apperti — Collar et al. (1994),Phyllastrephus,apperti,,subspecies,— Collar et al. (1994)
+22713004,Xanthomixis apperti,Phyllastrephus apperti ssp. apperti — Collar and Andrew (1988),Phyllastrephus,apperti,,subspecies,— Collar and Andrew (1988)
+22713004,Xanthomixis apperti,"Phyllastrephus apperti ssp. apperti — Sibley and Monroe (1990, 1993)",Phyllastrephus,apperti,,subspecies,"— Sibley and Monroe (1990, 1993)"
+22713004,Xanthomixis apperti,"Bernieria apperti Colston, 1972",Bernieria,apperti,"Colston, 1972",,
+210364856,Microcebus lehilahytsara,"Microcebus mittermeieri Louis Jr., Coles, Andriantompohavana, Sommer, Engberg, Zaonarivelo, Mayor &amp; Brenneman, 2006",Microcebus,mittermeieri,"Louis Jr., Coles, Andriantompohavana, Sommer, Engberg, Zaonarivelo, Mayor &amp; Brenneman, 2006",,
+210368667,Lepilemur dorsalis,"Lepilemur grandidieri (Forsyth Major, 1894)",Lepilemur,grandidieri,"(Forsyth Major, 1894)",,
+210368667,Lepilemur dorsalis,"Lepilemur mittermeieri Rabarivola, Zaramody, Fausser, Andriaholinirina, Roos, Zinner, Marcel &amp; Rumpler, 2006",Lepilemur,mittermeieri,"Rabarivola, Zaramody, Fausser, Andriaholinirina, Roos, Zinner, Marcel &amp; Rumpler, 2006",,
+22692264,Mentocrex kioloides,"Canirallus kioloides (Pucheran, 1845)",Canirallus,kioloides,"(Pucheran, 1845)",,
+22688493,Tyto soumagnei,"Heliodilus Soumagnei Grandidier, 1878",Heliodilus,Soumagnei,"Grandidier, 1878",,
+22683156,Corythornis madagascariensis,"Ispidina madagascariensis madagascariensis Sibley and Monroe (1990, 1993)",Ispidina madagascariensis,madagascariensis,"Sibley and Monroe (1990, 1993)",,
+22683156,Corythornis madagascariensis,"Ceyx madagascariensis (Linnaeus, 1766)",Ceyx,madagascariensis,"(Linnaeus, 1766)",,
+22719753,Lepidopygia nana,"Lemuresthes nana nana Sibley and Monroe (1990, 1993)",Lemuresthes nana,nana,"Sibley and Monroe (1990, 1993)",,
+22719753,Lepidopygia nana,"Lonchura nana (Pucheran, 1845)",Lonchura,nana,"(Pucheran, 1845)",,
+22715475,Bradypterus seebohmi,"Amphilais seebohmi (Sharpe, 1879)",Amphilais,seebohmi,"(Sharpe, 1879)",,
+22708218,Monticola imerina,"Pseudocossyphus imerinus imerinus Sibley and Monroe (1990, 1993)",Pseudocossyphus imerinus,imerinus,"Sibley and Monroe (1990, 1993)",,
+22717018,Eremopterix hova,"Mirafra hova Hartlaub, 1860",Mirafra,hova,"Hartlaub, 1860",,
+22713039,Xanthomixis cinereiceps,Phyllastrephus cinereiceps ssp. cinereiceps — BirdLife International (2000),Phyllastrephus,cinereiceps,,subspecies,— BirdLife International (2000)
+22713039,Xanthomixis cinereiceps,Phyllastrephus cinereiceps ssp. cinereiceps — Collar et al. (1994),Phyllastrephus,cinereiceps,,subspecies,— Collar et al. (1994)
+22713039,Xanthomixis cinereiceps,Phyllastrephus cinereiceps ssp. cinereiceps —  Collar and Andrew (1988),Phyllastrephus,cinereiceps,,subspecies,—  Collar and Andrew (1988)
+22713039,Xanthomixis cinereiceps,"Phyllastrephus cinereiceps ssp. cinereiceps — Sibley and Monroe (1990, 1993)",Phyllastrephus,cinereiceps,,subspecies,"— Sibley and Monroe (1990, 1993)"
+22713039,Xanthomixis cinereiceps,"Bernieria cinereiceps (Sharpe, 1881)",Bernieria,cinereiceps,"(Sharpe, 1881)",,
+22716763,Oxylabes madagascariensis,"Hypositta perdita Peters, 1996",Hypositta,perdita,"Peters, 1996",,
+22712995,Xanthomixis zosterops,"Phyllastrephus zosterops zosterops Sibley and Monroe (1990, 1993)",Phyllastrephus zosterops,zosterops,"Sibley and Monroe (1990, 1993)",,
+22712995,Xanthomixis zosterops,"Bernieria zosterops (Sharpe, 1875)",Bernieria,zosterops,"(Sharpe, 1875)",,
+22712985,Bernieria madagascariensis,"Phyllastrephus madagascariensis madagascariensis Sibley and Monroe (1990, 1993)",Phyllastrephus madagascariensis,madagascariensis,"Sibley and Monroe (1990, 1993)",,
+22690000,Gactornis enarratus,"Caprimulgus enarratus Gray, 1871",Caprimulgus,enarratus,"Gray, 1871",,
+22689425,Athene superciliaris,"Ninox superciliaris (Vieillot, 1817)",Ninox,superciliaris,"(Vieillot, 1817)",,
+103804241,Cinnyris notatus,"Nectarinia notata (Müller, 1776)",Nectarinia,notata,"(Müller, 1776)",,
+22714564,Bradypterus brunneus,"Dromaeocercus brunneus Sharpe, 1877",Dromaeocercus,brunneus,"Sharpe, 1877",,
