@@ -9,9 +9,9 @@ params:
 
   # ---- optimized script-6 inputs ----
   # These must describe the same run.
-  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc.rds"
+  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc.rds"
 
-  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc_remove_1000_k_100"
+  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc_remove_1000_k_100"
 
   # ---- expected bundle metadata ----
   # These are validation checks only. Update them if running a different bundle.
@@ -19,7 +19,7 @@ params:
   expected_do_mammals: true
   expected_do_birds: true
   expected_do_ppm: true
-  expected_do_rangebag: false
+  expected_do_rangebag: true
   expected_exclude_least_concern: false
 
   # ---- outputs, under pipeline_output_dir/ana/ ----
