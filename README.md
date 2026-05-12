@@ -122,9 +122,7 @@ The scripts are numbered in approximate execution order. Scripts `1` through `4`
 - `Data/Clean/all_patch_lookup.rds`
 - `Data/Clean/all_connectivity.rds`
 - Optional/convenience output from the later block:
-  - `Data/Clean/Patches_binary_with_patches_only/<species>.tif`
-
-The optional binary-patch block also expects `Data/Clean/species_table_with_patches_only.csv`, which is not produced by the main canonical patch/connectivity block.
+  - `Data/Clean/Patches_binary/<species>.tif`
 
 ### `5.1_single_species_aoh_patches_pu_process.Rmd`
 
@@ -266,7 +264,7 @@ The YAML parameter `fp_name: stage_meta_fp.rds` is defined, but the current scri
 │   │   ├── all_connectivity.rds
 │   │   ├── Patches/
 │   │   │   └── <species>.tif
-│   │   ├── Patches_binary_with_patches_only/
+│   │   ├── Patches_binary/
 │   │   │   └── <species>.tif
 │   │   └── PriorityInputs/         # large; omitted
 │   │       └── pruning_inputs_*.rds

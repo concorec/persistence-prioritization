@@ -1,5 +1,5 @@
 ---
-title: "6_spatial_prioritization_pipeline_minimal"
+title: "6_spatial_prioritization_pipeline"
 output: html_document
 ---
 
@@ -44,7 +44,7 @@ DO_BIRDS   <- TRUE
 # These filter species using the sdm_method column written by script 4.
 # Valid selected methods are expected to be "PPM" and/or "RangeBag".
 DO_PPM      <- TRUE
-DO_RANGEBAG <- TRUE
+DO_RANGEBAG <- FALSE
 
 # Red List gate.
 # If TRUE, species with redlistCategory == "Least Concern" are excluded.
@@ -92,7 +92,7 @@ patch_lookup_rds_path  <- file.path("Data", "Clean", "all_patch_lookup.rds")
 connectivity_rds_path  <- file.path("Data", "Clean", "all_connectivity.rds")
 
 # Directory for reusable saved pruning-input bundles.
-pruning_input_bundle_dir <- file.path("Data", "Clean", "PruningTestInputs")
+pruning_input_bundle_dir <- file.path("Data", "Clean", "PriorityInputs")
 
 
 # ---------------------------------------------------------------------
@@ -7644,7 +7644,7 @@ CURVE_LABEL <- "q025"
 # Taxonomic gates. These must match the gates used when the pruning-input
 # bundle was created.
 DO_MAMMALS <- TRUE
-DO_BIRDS   <- FALSE
+DO_BIRDS   <- TRUE
 
 # SDM-source gates. These must also match the gates used when the
 # pruning-input bundle was created.
@@ -7653,7 +7653,7 @@ DO_RANGEBAG <- FALSE
 
 # Red List gate. This must also match the gate used when the
 # pruning-input bundle was created.
-EXCLUDE_LEAST_CONCERN <- TRUE
+EXCLUDE_LEAST_CONCERN <- FALSE
 
 cells_to_remove_per_iteration <- 1000L
 pruning_iterations_per_stage  <- 100L
@@ -7760,7 +7760,7 @@ redlist_selection_tag <- if (EXCLUDE_LEAST_CONCERN) {
 # 4) Paths
 # ---------------------------------------------------------------------
 pruning_input_bundle_path <- file.path(
-  "Data", "Clean", "PruningTestInputs",
+  "Data", "Clean", "PriorityInputs",
   sprintf(
     "pruning_inputs_curve_%s_taxa_%s_sdm_%s_redlist_%s.rds",
     CURVE_LABEL,
@@ -7773,7 +7773,7 @@ pruning_input_bundle_path <- file.path(
 patch_raster_dir <- file.path("Data", "Clean", "Patches")
 
 pipeline_output_dir <- file.path(
-  "Data", "Clean", "PriorityPipelineTest",
+  "Data", "Results", "PriorityRuns",
   sprintf(
     "curve_%s_taxa_%s_sdm_%s_redlist_%s_remove_%d_k_%d",
     CURVE_LABEL,

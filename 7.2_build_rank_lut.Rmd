@@ -8,22 +8,22 @@ params:
   curve: "q025"
 
   # ---- matched persistence-prioritization run ----
-  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc_remove_1000_k_100"
-  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc.rds"
+  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc_remove_1000_k_100"
+  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc.rds"
 
   # ---- inputs ----
   ana_subdir: "ana"
   stage_meta_name: "stage_meta.csv"
 
-  rank_path: "Data/Results/BenchmarkRankMaps/rankmap_abf.tif"
+  rank_path: "Data/Results/BenchmarkRankMaps/rankmap_abf_178.tif"
   species_csv: "Data/Clean/species_table.csv"
   patch_dir: "Data/Clean/Patches"
 
   # ---- outputs, under pipeline_output_dir/ana/<lut_dir>/ ----
-  lut_dir: "rank_lut_abf"
+  lut_dir: "rank_lut_abf_178"
   lut_prefix: "lut_stage_"
-  target_summary_name: "rank_stage_targets_abf.csv"
-  inventory_name: "rank_lut_inventory_abf.csv"
+  target_summary_name: "rank_stage_targets_abf_178.csv"
+  inventory_name: "rank_lut_inventory_abf_178.csv"
 
   # ---- matching behavior ----
   match_basis: "area"              # "area" or "cells"; use "area" for main analysis

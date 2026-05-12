@@ -8,8 +8,8 @@ params:
   curve: "q025"
 
   # ---- optimized script-6 / 7.1 / 7.2 inputs ----
-  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc_remove_1000_k_100"
-  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_redlist_include_lc.rds"
+  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc_remove_1000_k_100"
+  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc.rds"
 
   species_csv: "Data/Clean/species_table.csv"
 
@@ -19,7 +19,7 @@ params:
   pipe_patch_lookup_dir: "patch_lookup_tables"
   pipe_patch_lookup_prefix: "stage_patch_lookup_stage_"
 
-  rank_lut_dir: "rank_lut_abf"
+  rank_lut_dir: "rank_lut_abf_178"
   rank_lut_prefix: "lut_stage_"
 
   # "" = all stages in stage_meta; otherwise e.g. "0:20" or "0,1,2,10"
@@ -32,11 +32,11 @@ params:
   x_axis: "pct_removed"   # "pct_removed" or "stage"
 
   # ---- outputs, under pipeline_output_dir/ana/persist_cmp/ ----
-  out_subdir: "persist_cmp_abf"
-  pu_long_name: "pu_long_abf.csv"
-  sp_long_name: "sp_long_abf.csv"
-  stage_sum_name: "stage_sum_abf.csv"
-  stage_compare_name: "stage_compare_abf.csv"
+  out_subdir: "persist_cmp_abf_178"
+  pu_long_name: "pu_long_abf_178.csv"
+  sp_long_name: "sp_long_abf_178.csv"
+  stage_sum_name: "stage_sum_abf_178.csv"
+  stage_compare_name: "stage_compare_abf_178.csv"
 
   overwrite: true
 ---
@@ -891,6 +891,45 @@ print(stage_compare)
 ```
 
 ```{r}
+library(ggplot2)
+
+label_method <- function(x) {
+  dplyr::recode(
+    as.character(x),
+    pipe = "Persistence-based",
+    rank = "Area-ranked",
+    .default = as.character(x)
+  )
+}
+
+method_cols <- c(
+  "Persistence-based" = "#2E78AF",
+  "Area-ranked" = "#B7561D"
+)
+
+persist_breaks_shared <- seq(0, 1, by = 0.25)
+persist_labels_shared <- scales::label_number(accuracy = 0.01)
+
+stage_breaks_shared <- function(x) pretty(x, n = 5)
+
+xlab_plot <- "Stage"
+
+theme_persist <- function(base_size = 11) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.title = element_text(colour = "grey20"),
+      axis.text = element_text(colour = "grey20"),
+      axis.line = element_line(colour = "grey20", linewidth = 0.45),
+      axis.ticks = element_line(colour = "grey20", linewidth = 0.45),
+      legend.position = "top",
+      legend.title = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0),
+      plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+    )
+}
+```
+
+```{r}
 # ============================================================
 # 04_plot_mean — panel (a) for combined figure
 # ============================================================
@@ -954,50 +993,11 @@ p_mean_leg <- p_mean +
 focal_name <- if (!is.null(params$focus_species) && length(params$focus_species) >= 1L) {
   as.character(params$focus_species[[1]])
 } else {
-  "Galidia elegans" # "Hapalemur alaotrensis", "Pterocles personatus", "Galidia elegans"
+  "Fossa fossana" # "Hapalemur alaotrensis", "Pterocles personatus", "Galidia elegans", "Fossa fossana"
 }
 focal_id <- sid(focal_name)
 
 cat("[persist_cmp] focal species:", focal_name, "\n")
-```
-
-```{r}
-library(ggplot2)
-
-label_method <- function(x) {
-  dplyr::recode(
-    as.character(x),
-    pipe = "Persistence-based",
-    rank = "Area-ranked",
-    .default = as.character(x)
-  )
-}
-
-method_cols <- c(
-  "Persistence-based" = "#2E78AF",
-  "Area-ranked" = "#B7561D"
-)
-
-persist_breaks_shared <- seq(0, 1, by = 0.25)
-persist_labels_shared <- scales::label_number(accuracy = 0.01)
-
-stage_breaks_shared <- function(x) pretty(x, n = 5)
-
-xlab_plot <- "Stage"
-
-theme_persist <- function(base_size = 11) {
-  theme_classic(base_size = base_size) +
-    theme(
-      axis.title = element_text(colour = "grey20"),
-      axis.text = element_text(colour = "grey20"),
-      axis.line = element_line(colour = "grey20", linewidth = 0.45),
-      axis.ticks = element_line(colour = "grey20", linewidth = 0.45),
-      legend.position = "top",
-      legend.title = element_blank(),
-      plot.title = element_text(face = "bold", hjust = 0),
-      plot.margin = margin(5.5, 5.5, 5.5, 5.5)
-    )
-}
 ```
 
 ```{r}
@@ -1058,8 +1058,10 @@ p_focus <- ggplot(
 
 ```{r}
 # ============================================================
-# 06_top10_auc_gap — top 10 species by area between pipe vs rank
-# Uses trapezoidal integration of |pipe - rank| across x
+# 06_top10_auc_signed — top 10 species by signed area between pipe vs rank
+# Uses trapezoidal integration of pipe - rank across x
+# Positive values mean pipe > rank on net
+# Negative values mean rank > pipe on net
 # ============================================================
 
 if (!exists("sp_long")) sp_long <- fread(out_sp)
@@ -1122,36 +1124,50 @@ auc_dt <- dcast(
 auc_dt <- auc_dt[is.finite(pipe) & is.finite(rank)]
 setorder(auc_dt, species, stage_order)
 
-# Pointwise absolute gap between trajectories
-auc_dt[, gap := abs(pipe - rank)]
+# Signed gap between trajectories:
+# positive = persistence-based method has higher persistence
+# negative = area-ranked method has higher persistence
+auc_dt[, signed_gap_pipe_minus_rank := pipe - rank]
 
-# Trapezoidal AUC of the gap for each species
-top10_auc_gap <- auc_dt[, {
+# Trapezoidal signed AUC for each species
+top10_auc_signed <- auc_dt[, {
   if (.N < 2L) {
-    .(auc_gap = NA_real_)
+    .(auc_signed_pipe_minus_rank = NA_real_)
   } else {
     dx <- diff(x)
-    avg_gap <- (gap[-.N] + gap[-1L]) / 2
-    .(auc_gap = sum(dx * avg_gap, na.rm = TRUE))
+    avg_signed_gap <- (
+      signed_gap_pipe_minus_rank[-.N] +
+        signed_gap_pipe_minus_rank[-1L]
+    ) / 2
+
+    .(
+      auc_signed_pipe_minus_rank = sum(
+        dx * avg_signed_gap,
+        na.rm = TRUE
+      )
+    )
   }
 }, by = .(species, scientificName)]
 
 # Add taxon and body mass
-top10_auc_gap <- merge(
-  top10_auc_gap,
+top10_auc_signed <- merge(
+  top10_auc_signed,
   sp_meta,
   by = "species",
   all.x = TRUE,
   sort = FALSE
 )
 
-# Print the 10 species with the largest area between curves
-top10_auc_gap <- top10_auc_gap[is.finite(auc_gap)][order(-auc_gap)]
-top10_auc_gap[, rank := seq_len(.N)]
+# Print the 10 species with the largest positive signed AUC
+top10_auc_signed <- top10_auc_signed[
+  is.finite(auc_signed_pipe_minus_rank)
+][order(-auc_signed_pipe_minus_rank)]
+
+top10_auc_signed[, rank := seq_len(.N)]
 
 print(
-  top10_auc_gap[
-    1:min(10, .N),
+  top10_auc_signed[
+    1:min(20, .N),
     .(
       rank,
       scientificName,
@@ -1161,7 +1177,7 @@ print(
       diet,
       density,
       dispersal_dist_km,
-      auc_gap
+      auc_signed_pipe_minus_rank
     )
   ]
 )
