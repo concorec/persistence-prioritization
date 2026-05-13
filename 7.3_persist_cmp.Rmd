@@ -4,22 +4,28 @@
 title: "7.3_persist_cmp"
 output: html_document
 params:
-  # ---- run identity ----
-  curve: "q025"
+  # ---- run scenario ----
+  curve: "q025"                  # "q50", "q16", or "q025"
+  taxa: "mammals_birds"          # "mammals", "birds", or "mammals_birds"
+  sdm: "ppm_rangebag"            # "ppm", "rangebag", or "ppm_rangebag"
+  redlist: "include_lc"          # "include_lc" or "exclude_lc"
 
-  # ---- optimized script-6 / 7.1 / 7.2 inputs ----
-  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc_remove_1000_k_100"
-  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc.rds"
+  # Must match script 6 for this run
+  cells_to_remove_per_iteration: 1000
+  pruning_iterations_per_stage: 100
 
+  # ---- benchmark rank map ----
+  rank_method: "abf"             # "abf", "caz", or "cazmax"
+  rank_map_subdir: "benchmark_rank_maps"
+
+  # ---- inputs ----
   species_csv: "Data/Clean/species_table.csv"
-
   ana_subdir: "ana"
   stage_meta_name: "stage_meta.csv"
 
   pipe_patch_lookup_dir: "patch_lookup_tables"
   pipe_patch_lookup_prefix: "stage_patch_lookup_stage_"
 
-  rank_lut_dir: "rank_lut_abf_178"
   rank_lut_prefix: "lut_stage_"
 
   # "" = all stages in stage_meta; otherwise e.g. "0:20" or "0,1,2,10"
@@ -31,12 +37,8 @@ params:
   # ---- x-axis metadata copied into outputs ----
   x_axis: "pct_removed"   # "pct_removed" or "stage"
 
-  # ---- outputs, under pipeline_output_dir/ana/persist_cmp/ ----
-  out_subdir: "persist_cmp_abf_178"
-  pu_long_name: "pu_long_abf_178.csv"
-  sp_long_name: "sp_long_abf_178.csv"
-  stage_sum_name: "stage_sum_abf_178.csv"
-  stage_compare_name: "stage_compare_abf_178.csv"
+  # ---- plotting ----
+  focus_species: "Fossa fossana"
 
   overwrite: true
 ---
@@ -102,12 +104,49 @@ empty_norm_lut <- function() {
 }
 
 # ============================================================
-# Parameters
+# Parameters and paths
 # ============================================================
 
 curve <- as.character(params$curve)
+taxa <- as.character(params$taxa)
+sdm <- as.character(params$sdm)
+redlist <- as.character(params$redlist)
+
 assert(curve %in% c("q50", "q16", "q025"),
        "params$curve must be one of: q50, q16, q025.")
+
+assert(taxa %in% c("mammals", "birds", "mammals_birds"),
+       "params$taxa must be one of: mammals, birds, mammals_birds.")
+
+assert(sdm %in% c("ppm", "rangebag", "ppm_rangebag"),
+       "params$sdm must be one of: ppm, rangebag, ppm_rangebag.")
+
+assert(redlist %in% c("include_lc", "exclude_lc"),
+       "params$redlist must be one of: include_lc, exclude_lc.")
+
+cells_to_remove_per_iteration <- as.integer(params$cells_to_remove_per_iteration)
+pruning_iterations_per_stage <- as.integer(params$pruning_iterations_per_stage)
+
+assert(is.finite(cells_to_remove_per_iteration) &&
+         cells_to_remove_per_iteration > 0L,
+       "params$cells_to_remove_per_iteration must be a positive integer.")
+
+assert(is.finite(pruning_iterations_per_stage) &&
+         pruning_iterations_per_stage > 0L,
+       "params$pruning_iterations_per_stage must be a positive integer.")
+
+rank_method <- tolower(as.character(params$rank_method))
+assert(rank_method %in% c("abf", "caz", "cazmax"),
+       "params$rank_method must be one of: abf, caz, cazmax.")
+
+rank_label <- switch(
+  rank_method,
+  abf = "Zonation ABF",
+  caz = "Zonation CAZ",
+  cazmax = "Zonation CAZMAX"
+)
+
+rank_map_subdir <- as.character(params$rank_map_subdir)
 
 overwrite <- isTRUE(params$overwrite)
 
@@ -115,12 +154,29 @@ x_axis <- as.character(params$x_axis)
 assert(x_axis %in% c("pct_removed", "stage"),
        "params$x_axis must be 'pct_removed' or 'stage'.")
 
-# ============================================================
-# Paths
-# ============================================================
+run_id <- sprintf(
+  "curve_%s_taxa_%s_sdm_%s_redlist_%s_remove_%d_k_%d",
+  curve,
+  taxa,
+  sdm,
+  redlist,
+  cells_to_remove_per_iteration,
+  pruning_iterations_per_stage
+)
 
-out_curve <- as.character(params$pipeline_output_dir)
-bundle_path <- as.character(params$pruning_input_bundle_path)
+out_curve <- file.path("Data", "Results", "PriorityRuns", run_id)
+
+bundle_path <- file.path(
+  "Data", "Clean", "PriorityInputs",
+  sprintf(
+    "pruning_inputs_curve_%s_taxa_%s_sdm_%s_redlist_%s.rds",
+    curve,
+    taxa,
+    sdm,
+    redlist
+  )
+)
+
 species_csv <- as.character(params$species_csv)
 
 ana <- file.path(out_curve, as.character(params$ana_subdir))
@@ -129,16 +185,32 @@ stage_meta_csv <- file.path(ana, as.character(params$stage_meta_name))
 pipe_lookup_dir <- file.path(out_curve, as.character(params$pipe_patch_lookup_dir))
 pipe_prefix <- as.character(params$pipe_patch_lookup_prefix)
 
-rank_lut_root <- file.path(ana, as.character(params$rank_lut_dir))
+rank_lut_root <- file.path(ana, paste0("rank_lut_", rank_method))
 rank_prefix <- as.character(params$rank_lut_prefix)
 
-out_root <- file.path(ana, as.character(params$out_subdir))
+rank_path <- file.path(
+  out_curve,
+  rank_map_subdir,
+  paste0("rankmap_", rank_method, ".tif")
+)
+
+target_summary_csv <- file.path(
+  rank_lut_root,
+  paste0("rank_stage_targets_", rank_method, ".csv")
+)
+
+inventory_csv <- file.path(
+  rank_lut_root,
+  paste0("rank_lut_inventory_", rank_method, ".csv")
+)
+
+out_root <- file.path(ana, paste0("persist_cmp_", rank_method))
 dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
 
-out_pu <- file.path(out_root, as.character(params$pu_long_name))
-out_sp <- file.path(out_root, as.character(params$sp_long_name))
-out_stage <- file.path(out_root, as.character(params$stage_sum_name))
-out_compare <- file.path(out_root, as.character(params$stage_compare_name))
+out_pu <- file.path(out_root, paste0("pu_long_", rank_method, ".csv"))
+out_sp <- file.path(out_root, paste0("sp_long_", rank_method, ".csv"))
+out_stage <- file.path(out_root, paste0("stage_sum_", rank_method, ".csv"))
+out_compare <- file.path(out_root, paste0("stage_compare_", rank_method, ".csv"))
 
 need_dir(out_curve, "pipeline_output_dir")
 need_file(bundle_path, "pruning input bundle")
@@ -147,6 +219,14 @@ need_file(stage_meta_csv, "stage_meta.csv from 7.1")
 need_dir(pipe_lookup_dir, "optimized script-6 patch_lookup_tables")
 need_dir(rank_lut_root, "rank-map LUT output from 7.2")
 need_dir(out_root, "persist_cmp output directory")
+
+cat("\n=== 7.3_persist_cmp ===\n")
+cat("run_id      :", run_id, "\n")
+cat("rank_method :", rank_method, "\n")
+cat("rank_label  :", rank_label, "\n")
+cat("out_curve   :", out_curve, "\n")
+cat("rank_lut    :", rank_lut_root, "\n")
+cat("out_root    :", out_root, "\n\n")
 
 # ============================================================
 # Load bundle and stage metadata
@@ -894,17 +974,15 @@ print(stage_compare)
 library(ggplot2)
 
 label_method <- function(x) {
-  dplyr::recode(
-    as.character(x),
-    pipe = "Persistence-based",
-    rank = "Area-ranked",
-    .default = as.character(x)
-  )
+  out <- as.character(x)
+  out[out == "pipe"] <- "Persistence-based"
+  out[out == "rank"] <- rank_label
+  out
 }
 
-method_cols <- c(
-  "Persistence-based" = "#2E78AF",
-  "Area-ranked" = "#B7561D"
+method_cols <- setNames(
+  c("#2E78AF", "#B7561D"),
+  c("Persistence-based", rank_label)
 )
 
 persist_breaks_shared <- seq(0, 1, by = 0.25)
