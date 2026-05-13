@@ -4,30 +4,32 @@
 title: "7.2_build_rank_lut"
 output: html_document
 params:
-  # ---- run identity ----
-  curve: "q025"
+  # ---- run scenario ----
+  curve: "q025"                  # "q50", "q16", or "q025"
+  taxa: "mammals_birds"          # "mammals", "birds", or "mammals_birds"
+  sdm: "ppm_rangebag"            # "ppm", "rangebag", or "ppm_rangebag"
+  redlist: "include_lc"          # "include_lc" or "exclude_lc"
 
-  # ---- matched persistence-prioritization run ----
-  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc_remove_1000_k_100"
-  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc.rds"
+  # Must match script 6 for this run
+  cells_to_remove_per_iteration: 1000
+  pruning_iterations_per_stage: 100
+
+  # ---- benchmark rank map ----
+  rank_method: "abf"             # "abf", "caz", or "cazmax"
+  rank_map_subdir: "benchmark_rank_maps"
 
   # ---- inputs ----
   ana_subdir: "ana"
   stage_meta_name: "stage_meta.csv"
-
-  rank_path: "Data/Results/BenchmarkRankMaps/rankmap_abf_178.tif"
   species_csv: "Data/Clean/species_table.csv"
   patch_dir: "Data/Clean/Patches"
 
-  # ---- outputs, under pipeline_output_dir/ana/<lut_dir>/ ----
-  lut_dir: "rank_lut_abf_178"
+  # ---- outputs ----
   lut_prefix: "lut_stage_"
-  target_summary_name: "rank_stage_targets_abf_178.csv"
-  inventory_name: "rank_lut_inventory_abf_178.csv"
 
   # ---- matching behavior ----
   match_basis: "area"              # "area" or "cells"; use "area" for main analysis
-  rank_higher_is_better: true      # true if higher rank values should be retained first
+  rank_higher_is_better: true
   include_stage0: true
   restrict_stages: ""              # "" for all stages, or e.g. "0:20"
 
@@ -118,12 +120,40 @@ empty_lut <- function(stage = integer()) {
 }
 
 # ============================================================
-# Params
+# Params and paths
 # ============================================================
 
 curve <- as.character(params$curve)
+taxa <- as.character(params$taxa)
+sdm <- as.character(params$sdm)
+redlist <- as.character(params$redlist)
+
 assert(curve %in% c("q50", "q16", "q025"),
        "params$curve must be q50, q16, or q025.")
+
+assert(taxa %in% c("mammals", "birds", "mammals_birds"),
+       "params$taxa must be one of: mammals, birds, mammals_birds.")
+
+assert(sdm %in% c("ppm", "rangebag", "ppm_rangebag"),
+       "params$sdm must be one of: ppm, rangebag, ppm_rangebag.")
+
+assert(redlist %in% c("include_lc", "exclude_lc"),
+       "params$redlist must be one of: include_lc, exclude_lc.")
+
+cells_to_remove_per_iteration <- as.integer(params$cells_to_remove_per_iteration)
+pruning_iterations_per_stage <- as.integer(params$pruning_iterations_per_stage)
+
+assert(is.finite(cells_to_remove_per_iteration) &&
+         cells_to_remove_per_iteration > 0L,
+       "params$cells_to_remove_per_iteration must be a positive integer.")
+
+assert(is.finite(pruning_iterations_per_stage) &&
+         pruning_iterations_per_stage > 0L,
+       "params$pruning_iterations_per_stage must be a positive integer.")
+
+rank_method <- tolower(as.character(params$rank_method))
+assert(rank_method %in% c("abf", "caz", "cazmax"),
+       "params$rank_method must be one of: abf, caz, cazmax.")
 
 match_basis <- as.character(params$match_basis)
 assert(match_basis %in% c("area", "cells"),
@@ -148,43 +178,73 @@ if (identical(clump_backend, "fasterRaster")) {
   fasterRaster::faster(grassDir = grassDir)
 }
 
-# ============================================================
-# Paths
-# ============================================================
+run_id <- sprintf(
+  "curve_%s_taxa_%s_sdm_%s_redlist_%s_remove_%d_k_%d",
+  curve,
+  taxa,
+  sdm,
+  redlist,
+  cells_to_remove_per_iteration,
+  pruning_iterations_per_stage
+)
 
-out_curve <- as.character(params$pipeline_output_dir)
-bundle_path <- as.character(params$pruning_input_bundle_path)
+out_curve <- file.path("Data", "Results", "PriorityRuns", run_id)
+
+bundle_path <- file.path(
+  "Data", "Clean", "PriorityInputs",
+  sprintf(
+    "pruning_inputs_curve_%s_taxa_%s_sdm_%s_redlist_%s.rds",
+    curve,
+    taxa,
+    sdm,
+    redlist
+  )
+)
 
 ana <- file.path(out_curve, as.character(params$ana_subdir))
 stage_meta_csv <- file.path(ana, as.character(params$stage_meta_name))
 
-rank_path <- as.character(params$rank_path)
+rank_path <- file.path(
+  out_curve,
+  as.character(params$rank_map_subdir),
+  paste0("rankmap_", rank_method, ".tif")
+)
+
 species_csv <- as.character(params$species_csv)
 patch_dir <- as.character(params$patch_dir)
 
-lut_root <- file.path(ana, as.character(params$lut_dir))
+lut_root <- file.path(ana, paste0("rank_lut_", rank_method))
 dir.create(lut_root, recursive = TRUE, showWarnings = FALSE)
 
-target_summary_csv <- file.path(lut_root, as.character(params$target_summary_name))
-inventory_csv <- file.path(lut_root, as.character(params$inventory_name))
+target_summary_csv <- file.path(
+  lut_root,
+  paste0("rank_stage_targets_", rank_method, ".csv")
+)
+
+inventory_csv <- file.path(
+  lut_root,
+  paste0("rank_lut_inventory_", rank_method, ".csv")
+)
 
 lut_prefix <- as.character(params$lut_prefix)
 
 need_dir(out_curve, "pipeline_output_dir")
 need_file(bundle_path, "pruning input bundle")
 need_file(stage_meta_csv, "stage_meta.csv from 7.1")
-need_file(rank_path, "benchmark rank map")
+need_file(rank_path, "run-specific benchmark rank map")
 need_file(species_csv, "species_table.csv")
 need_dir(patch_dir, "patch raster directory")
 need_dir(lut_root, "rank_lut output directory")
 
 cat("\n=== 7.2_build_rank_lut ===\n")
-cat("pipeline_output_dir:", out_curve, "\n")
-cat("ana                :", ana, "\n")
-cat("rank_path          :", rank_path, "\n")
-cat("lut_root           :", lut_root, "\n")
-cat("match_basis        :", match_basis, "\n")
-cat("rank_higher_is_better:", rank_higher_is_better, "\n\n")
+cat("run_id                :", run_id, "\n")
+cat("rank_method           :", rank_method, "\n")
+cat("pipeline_output_dir   :", out_curve, "\n")
+cat("ana                   :", ana, "\n")
+cat("rank_path             :", rank_path, "\n")
+cat("lut_root              :", lut_root, "\n")
+cat("match_basis           :", match_basis, "\n")
+cat("rank_higher_is_better :", rank_higher_is_better, "\n\n")
 ```
 
 ---
