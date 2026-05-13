@@ -44,7 +44,7 @@ DO_BIRDS   <- TRUE
 # These filter species using the sdm_method column written by script 4.
 # Valid selected methods are expected to be "PPM" and/or "RangeBag".
 DO_PPM      <- TRUE
-DO_RANGEBAG <- FALSE
+DO_RANGEBAG <- TRUE
 
 # Red List gate.
 # If TRUE, species with redlistCategory == "Least Concern" are excluded.
@@ -7649,7 +7649,7 @@ DO_BIRDS   <- TRUE
 # SDM-source gates. These must also match the gates used when the
 # pruning-input bundle was created.
 DO_PPM      <- TRUE
-DO_RANGEBAG <- FALSE
+DO_RANGEBAG <- TRUE
 
 # Red List gate. This must also match the gate used when the
 # pruning-input bundle was created.
