@@ -7268,6 +7268,48 @@ run_priority_pipeline <- function(
     # Return the number of cells recorded in this event.
     invisible(cells_removed_this_event)
   }
+  
+  
+  
+  record_final_retained_cells <- function(stage_index) {
+    # Identify initially alive cells that never received a removal-order value.
+    final_retained_cells <- which(
+      initial_alive_by_cell &
+        is.na(removal_order_by_cell)
+    )
+  
+    # Return immediately if nothing remains.
+    if (!length(final_retained_cells)) {
+      return(invisible(0L))
+    }
+  
+    # Assign one final removal-order step to all retained-to-end cells.
+    this_step <- as.integer(removal_step_counter)
+  
+    removal_order_by_cell[final_retained_cells] <<- this_step
+  
+    # Compute retained-to-end area.
+    final_retained_area_km2 <- sum(
+      cell_area_by_cell[final_retained_cells],
+      na.rm = TRUE
+    )
+  
+    # Add a final event row so removal_order.tif and removal_events.csv stay consistent.
+    removal_event_rows[[length(removal_event_rows) + 1L]] <<-
+      data.table::data.table(
+        removal_step = this_step,
+        stage = as.integer(stage_index),
+        event_type = "final_retained",
+        pruning_iteration = NA_integer_,
+        cells_removed = as.integer(length(final_retained_cells)),
+        area_removed_km2 = as.numeric(final_retained_area_km2)
+      )
+  
+    # Advance the event counter.
+    removal_step_counter <<- removal_step_counter + 1L
+  
+    invisible(length(final_retained_cells))
+  }
 
 
 
@@ -7489,11 +7531,28 @@ run_priority_pipeline <- function(
     # Store the number of completed full global stages.
     completed_stages <- as.integer(stage_index)
   }
+  
+  
+  
+  # -------------------------------------------------------------------
+  # 9. Assign the final retained layer after frontier exhaustion
+  # -------------------------------------------------------------------
+  
+  # If the algorithm stopped because the frontier was too small for another
+  # full pruning batch, assign every still-unordered initially alive cell to
+  # one final removal-order layer. These are the cells retained to the end.
+  final_retained_cell_count <- 0L
+  
+  if (isTRUE(frontier_exhausted)) {
+    final_retained_cell_count <- record_final_retained_cells(
+      stage_index = completed_stages
+    )
+  }
 
 
 
   # -------------------------------------------------------------------
-  # 9. Write the final removal-order raster once
+  # 10. Write the final removal-order raster once
   # -------------------------------------------------------------------
 
   # Write the final cell-level removal order raster.
@@ -7586,7 +7645,7 @@ run_priority_pipeline <- function(
 
 
   # -------------------------------------------------------------------
-  # 10. Compute compact final-run summaries
+  # 11. Compute compact final-run summaries
   # -------------------------------------------------------------------
 
   # Count cells that were alive at the start of the run.
@@ -7607,7 +7666,7 @@ run_priority_pipeline <- function(
 
 
   # -------------------------------------------------------------------
-  # 11. Return the final in-memory state and output paths
+  # 12. Return the final in-memory state and output paths
   # -------------------------------------------------------------------
 
   # Return the final state and compact output metadata.
