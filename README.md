@@ -181,26 +181,27 @@ The scripts are numbered in approximate execution order. Scripts `1` through `4`
 
 The YAML parameter `fp_name: stage_meta_fp.rds` is defined, but the current script does not appear to write that file.
 
-### `7.2_build_abf_rank_lut.Rmd`
+### `7.2_build_rank_lut.Rmd`
 
-**Purpose:** Builds benchmark lookup tables for a rank-map method, configured here for Zonation ABF. It matches the benchmark rank map to the same retained-area or retained-cell targets as the persistence-based stages, reconstructs retained landscapes at each stage, recalculates patches and population units, and writes stage-specific lookup tables for persistence evaluation.
+**Purpose:** Builds benchmark lookup tables for a selected rank-map method, controlled by the YAML parameter `rank_method` (`"abf"`, `"caz"`, or `"cazmax"`). It matches the selected benchmark rank map to the same retained-area or retained-cell targets as the persistence-based stages, reconstructs retained landscapes at each stage, recalculates patches and population units, and writes stage-specific lookup tables for persistence evaluation.
 
 **Required inputs:**
 
 - Matching pruning-input bundle from `Data/Clean/PriorityInputs/`
 - `Data/Results/PriorityRuns/<run_id>/ana/stage_meta.csv`
 - `Data/Results/PriorityRuns/<run_id>/removal_order.tif` as the template grid
-- `Data/Results/BenchmarkRankMaps/rankmap_abf.tif`
-- `Data/Clean/species_table.csv`
+- `Data/Results/PriorityRuns/<run_id>/benchmark_rank_maps/rankmap_<rank_method>.tif`
+  - for ABF: `Data/Results/PriorityRuns/<run_id>/benchmark_rank_maps/rankmap_abf.tif`
+  - for CAZ: `Data/Results/PriorityRuns/<run_id>/benchmark_rank_maps/rankmap_caz.tif`- `Data/Clean/species_table.csv`
 - `Data/Clean/Patches/<species>.tif`
 - GRASS GIS / `fasterRaster`, unless using the `terra` clump backend
 
 **Outputs:**
 
-- `Data/Results/PriorityRuns/<run_id>/ana/rank_lut_abf/rank_stage_targets_abf.csv`
-- `Data/Results/PriorityRuns/<run_id>/ana/rank_lut_abf/lut_stage_0000.rds`
-- `Data/Results/PriorityRuns/<run_id>/ana/rank_lut_abf/lut_stage_####.rds`
-- `Data/Results/PriorityRuns/<run_id>/ana/rank_lut_abf/rank_lut_inventory_abf.csv`
+- `Data/Results/PriorityRuns/<run_id>/ana/rank_lut_<rank_method>/rank_stage_targets_<rank_method>.csv`
+- `Data/Results/PriorityRuns/<run_id>/ana/rank_lut_<rank_method>/lut_stage_0000.rds`
+- `Data/Results/PriorityRuns/<run_id>/ana/rank_lut_<rank_method>/lut_stage_####.rds`
+- `Data/Results/PriorityRuns/<run_id>/ana/rank_lut_<rank_method>/rank_lut_inventory_<rank_method>.csv`
 
 ### `7.3_persist_cmp.Rmd`
 
@@ -234,7 +235,7 @@ The YAML parameter `fp_name: stage_meta_fp.rds` is defined, but the current scri
 ├── 5.1_single_species_aoh_patches_pu_process.Rmd
 ├── 6_spatial_prioritization_pipeline.Rmd
 ├── 7.1_stage_meta_and_priority_surface.Rmd
-├── 7.2_build_abf_rank_lut.Rmd
+├── 7.2_build_rank_lut.Rmd
 ├── 7.3_persist_cmp.Rmd
 ├── src/
 │   └── simulate_persist_probs_cpp.cpp
@@ -271,11 +272,11 @@ The YAML parameter `fp_name: stage_meta_fp.rds` is defined, but the current scri
 │   └── Results/
 │       ├── persist_points_mammals.csv
 │       ├── persist_points_birds.csv
-│       ├── BenchmarkRankMaps/
-│       │   └── rankmap_abf.tif
-│       │   └── rankmap_caz.tif
 │       └── PriorityRuns/
 │           └── <run_id>/
+│               ├── benchmark_rank_maps/
+│               │   ├── rankmap_abf.tif
+│               │   └── rankmap_caz.tif
 │               ├── removal_order.tif
 │               ├── removal_events.csv
 │               ├── patch_lookup_tables/       # large; omitted
@@ -305,7 +306,7 @@ The YAML parameter `fp_name: stage_meta_fp.rds` is defined, but the current scri
 5. Run `5_build_patches_and_connectivity.Rmd` to create patch rasters, patch lookup tables, and connectivity objects.
 6. Run `6_spatial_prioritization_pipeline.Rmd` to create/load the pruning-input bundle and execute the priority-ranking algorithm.
 7. Run `7.1_stage_meta_and_priority_surface.Rmd` to build analysis metadata and the priority surface.
-8. Run `7.2_build_abf_rank_lut.Rmd` to reconstruct benchmark ABF retained landscapes at matched stages.
+8. Run `7.2_build_rank_lut.Rmd` to reconstruct benchmark ABF retained landscapes at matched stages.
 9. Run `7.3_persist_cmp.Rmd` to compare persistence outcomes between the persistence-based prioritization and ABF benchmark.
 10. Use `5.1_single_species_aoh_patches_pu_process.Rmd` independently when a visual example of the AOH-to-population-unit workflow is needed.
 
