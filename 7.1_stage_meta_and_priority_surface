@@ -4,36 +4,25 @@
 title: "7.1_stage_meta_and_priority_surface"
 output: html_document
 params:
-  # ---- run identity ----
-  curve: "q025"
+  # ---- run scenario ----
+  curve: "q025"                  # "q50", "q16", or "q025"
+  taxa: "mammals_birds"          # "mammals", "birds", or "mammals_birds"
+  sdm: "ppm_rangebag"            # "ppm", "rangebag", or "ppm_rangebag"
+  redlist: "include_lc"          # "include_lc" or "exclude_lc"
 
-  # ---- optimized script-6 inputs ----
-  # These must describe the same run.
-  pruning_input_bundle_path: "Data/Clean/PriorityInputs/pruning_inputs_curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc.rds"
+  # Must match script 6 for this run
+  cells_to_remove_per_iteration: 1000
+  pruning_iterations_per_stage: 100
 
-  pipeline_output_dir: "Data/Results/PriorityRuns/curve_q025_taxa_mammals_birds_sdm_ppm_rangebag_redlist_include_lc_remove_1000_k_100"
-
-  # ---- expected bundle metadata ----
-  # These are validation checks only. Update them if running a different bundle.
-  validate_bundle_metadata: true
-  expected_do_mammals: true
-  expected_do_birds: true
-  expected_do_ppm: true
-  expected_do_rangebag: true
-  expected_exclude_least_concern: false
-
-  # ---- outputs, under pipeline_output_dir/ana/ ----
+  # ---- standard locations/names ----
   ana_subdir: "ana"
-
   stage_meta_name: "stage_meta.csv"
   priority_surface_name: "priority_surface_prop_removed.tif"
-  fp_name: "stage_meta_fp.rds"
 
   # ---- controls ----
   build_priority_surface: true
   overwrite: true
-
-  # The manuscript/SI comparison is area-matched, so use area by default.
+  validate_bundle_metadata: true
   priority_surface_basis: "area"   # "area" or "cells"
 ---
 
@@ -66,8 +55,61 @@ stagetag <- function(x) sprintf("%04d", as.integer(x))
 # ============================================================
 
 curve <- as.character(params$curve)
+taxa <- as.character(params$taxa)
+sdm <- as.character(params$sdm)
+redlist <- as.character(params$redlist)
+
 assert(curve %in% c("q50", "q16", "q025"),
        "params$curve must be one of: q50, q16, q025.")
+
+assert(taxa %in% c("mammals", "birds", "mammals_birds"),
+       "params$taxa must be one of: mammals, birds, mammals_birds.")
+
+assert(sdm %in% c("ppm", "rangebag", "ppm_rangebag"),
+       "params$sdm must be one of: ppm, rangebag, ppm_rangebag.")
+
+assert(redlist %in% c("include_lc", "exclude_lc"),
+       "params$redlist must be one of: include_lc, exclude_lc.")
+
+cells_to_remove_per_iteration <- as.integer(params$cells_to_remove_per_iteration)
+pruning_iterations_per_stage <- as.integer(params$pruning_iterations_per_stage)
+
+assert(is.finite(cells_to_remove_per_iteration) &&
+         cells_to_remove_per_iteration > 0L,
+       "params$cells_to_remove_per_iteration must be a positive integer.")
+
+assert(is.finite(pruning_iterations_per_stage) &&
+         pruning_iterations_per_stage > 0L,
+       "params$pruning_iterations_per_stage must be a positive integer.")
+
+do_mammals <- taxa %in% c("mammals", "mammals_birds")
+do_birds <- taxa %in% c("birds", "mammals_birds")
+do_ppm <- sdm %in% c("ppm", "ppm_rangebag")
+do_rangebag <- sdm %in% c("rangebag", "ppm_rangebag")
+exclude_least_concern <- identical(redlist, "exclude_lc")
+
+run_id <- sprintf(
+  "curve_%s_taxa_%s_sdm_%s_redlist_%s_remove_%d_k_%d",
+  curve,
+  taxa,
+  sdm,
+  redlist,
+  cells_to_remove_per_iteration,
+  pruning_iterations_per_stage
+)
+
+bundle_path <- file.path(
+  "Data", "Clean", "PriorityInputs",
+  sprintf(
+    "pruning_inputs_curve_%s_taxa_%s_sdm_%s_redlist_%s.rds",
+    curve,
+    taxa,
+    sdm,
+    redlist
+  )
+)
+
+out_curve <- file.path("Data", "Results", "PriorityRuns", run_id)
 
 do_surface <- isTRUE(params$build_priority_surface)
 overwrite  <- isTRUE(params$overwrite)
@@ -76,34 +118,19 @@ surface_basis <- as.character(params$priority_surface_basis)
 assert(surface_basis %in% c("area", "cells"),
        "params$priority_surface_basis must be 'area' or 'cells'.")
 
-bundle_path <- as.character(params$pruning_input_bundle_path)
-out_curve   <- as.character(params$pipeline_output_dir)
-
 need_file(bundle_path, "pruning input bundle")
 need_dir(out_curve, "optimized pipeline output directory")
-
-# ============================================================
-# Required optimized script-6 outputs
-# ============================================================
-
-removal_order_path  <- file.path(out_curve, "removal_order.tif")
-removal_events_path <- file.path(out_curve, "removal_events.csv")
-patch_lookup_dir    <- file.path(out_curve, "patch_lookup_tables")
-
-need_file(removal_order_path, "removal_order.tif")
-need_file(removal_events_path, "removal_events.csv")
-need_dir(patch_lookup_dir, "patch_lookup_tables")
-
-# ============================================================
-# Output paths
-# ============================================================
 
 ana <- file.path(out_curve, as.character(params$ana_subdir))
 dir.create(ana, recursive = TRUE, showWarnings = FALSE)
 
 stage_meta_csv <- file.path(ana, as.character(params$stage_meta_name))
 priority_surface_tif <- file.path(ana, as.character(params$priority_surface_name))
-fp_rds <- file.path(ana, as.character(params$fp_name))
+
+cat("\n=== 7.1_stage_meta_and_priority_surface ===\n")
+cat("run_id      :", run_id, "\n")
+cat("bundle_path :", bundle_path, "\n")
+cat("out_curve   :", out_curve, "\n\n")
 
 # ============================================================
 # Load pruning-input bundle
@@ -145,25 +172,21 @@ if (isTRUE(params$validate_bundle_metadata)) {
          paste0("Bundle curve_label mismatch. Expected ", curve,
                 " but bundle contains ", bundle$metadata$curve_label, "."))
 
-  assert(identical(as.logical(bundle$metadata$do_mammals),
-                   as.logical(params$expected_do_mammals)),
-         "Bundle do_mammals does not match params$expected_do_mammals.")
+  assert(identical(as.logical(bundle$metadata$do_mammals), do_mammals),
+         "Bundle do_mammals does not match params$taxa.")
 
-  assert(identical(as.logical(bundle$metadata$do_birds),
-                   as.logical(params$expected_do_birds)),
-         "Bundle do_birds does not match params$expected_do_birds.")
+  assert(identical(as.logical(bundle$metadata$do_birds), do_birds),
+         "Bundle do_birds does not match params$taxa.")
 
-  assert(identical(as.logical(bundle$metadata$do_ppm),
-                   as.logical(params$expected_do_ppm)),
-         "Bundle do_ppm does not match params$expected_do_ppm.")
+  assert(identical(as.logical(bundle$metadata$do_ppm), do_ppm),
+         "Bundle do_ppm does not match params$sdm.")
 
-  assert(identical(as.logical(bundle$metadata$do_rangebag),
-                   as.logical(params$expected_do_rangebag)),
-         "Bundle do_rangebag does not match params$expected_do_rangebag.")
+  assert(identical(as.logical(bundle$metadata$do_rangebag), do_rangebag),
+         "Bundle do_rangebag does not match params$sdm.")
 
   assert(identical(as.logical(bundle$metadata$exclude_least_concern),
-                   as.logical(params$expected_exclude_least_concern)),
-         "Bundle exclude_least_concern does not match params$expected_exclude_least_concern.")
+                   exclude_least_concern),
+         "Bundle exclude_least_concern does not match params$redlist.")
 }
 
 # ============================================================
